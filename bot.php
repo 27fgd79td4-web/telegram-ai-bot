@@ -433,6 +433,40 @@ class ActivityLogRepository {
     }
 }
 
+class SettingsRepository {
+    public function __construct(private PDO $pdo) {
+        $this->pdo->exec("
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+            );
+        ");
+    }
+
+    public function get(string $key, ?string $default = null): ?string {
+        try {
+            $stmt = $this->pdo->prepare("SELECT value FROM bot_settings WHERE key = ?");
+            $stmt->execute([$key]);
+            $val = $stmt->fetchColumn();
+            return $val !== false ? (string)$val : $default;
+        } catch (Throwable) {
+            return $default;
+        }
+    }
+
+    public function set(string $key, string $value): void {
+        try {
+            $stmt = $this->pdo->prepare("
+                INSERT INTO bot_settings (key, value, updated_at) 
+                VALUES (?, ?, datetime('now'))
+                ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = datetime('now')
+            ");
+            $stmt->execute([$key, $value]);
+        } catch (Throwable) {}
+    }
+}
+
 // ============================================================================
 // 5. SERVISLAR
 // ============================================================================
@@ -1073,7 +1107,10 @@ class Keyboards {
             ['text' => '📥 Oxirgi 50 ta harakatni yuklash', 'callback_data' => 'sheets:sync'],
         ];
         $buttons[] = [
+            ['text' => '⚙️ Webhook URL kiritish', 'callback_data' => 'sheets:set_webhook'],
             ['text' => 'ℹ️ Sozlash qo\'llanmasi', 'callback_data' => 'sheets:guide'],
+        ];
+        $buttons[] = [
             ['text' => '⬅️ Orqaga', 'callback_data' => 'admin:back'],
         ];
         return ['inline_keyboard' => $buttons];
@@ -1147,6 +1184,7 @@ class TelegramBot {
     private UsageRepository $usages;
     private FileRepository $files;
     private ActivityLogRepository $activityLogs;
+    private SettingsRepository $botSettings;
     private GoogleSheetsService $sheets;
     private GeminiService $gemini;
     private DocumentService $docService;
@@ -1177,6 +1215,17 @@ class TelegramBot {
         $this->files   = new FileRepository($pdo);
 
         $this->activityLogs  = new ActivityLogRepository($pdo);
+        $this->botSettings   = new SettingsRepository($pdo);
+
+        $savedWebhook = $this->botSettings->get('GOOGLE_SHEETS_WEBHOOK_URL');
+        if (!empty($savedWebhook)) {
+            $this->settings->GOOGLE_SHEETS_WEBHOOK_URL = $savedWebhook;
+        }
+        $savedSheetUrl = $this->botSettings->get('GOOGLE_SHEET_URL');
+        if (!empty($savedSheetUrl)) {
+            $this->settings->GOOGLE_SHEET_URL = $savedSheetUrl;
+        }
+
         $this->sheets        = new GoogleSheetsService($settings, $logger);
 
         $this->gemini        = new GeminiService($settings);
@@ -1284,6 +1333,16 @@ class TelegramBot {
             if ($text === '/history')                       { $this->cmdHistory($uid, $chatId); return; }
             if ($text === '/settings' || $text === '⚙️ Sozlamalar') { $this->cmdSettings($chatId); return; }
             if ($text === '/admin' && $this->settings->isAdmin($uid)) { $this->cmdAdmin($chatId); return; }
+            if (str_starts_with($text, '/set_sheets') && $this->settings->isAdmin($uid)) {
+                $parts = explode(' ', trim($text), 2);
+                $url = trim($parts[1] ?? '');
+                if (empty($url)) {
+                    $this->tg->sendMessage($chatId, "ℹ️ <b>Foydalanish:</b>\n<code>/set_sheets https://script.google.com/macros/s/.../exec</code>");
+                    return;
+                }
+                $this->handleSetWebhook($uid, $chatId, $url);
+                return;
+            }
 
             // Menyu tugmalari
             switch ($text) {
@@ -1338,6 +1397,7 @@ class TelegramBot {
         // FSM states bo'yicha yo'naltirish
         $state = $this->states->getState($uid);
 
+        if ($state === 'admin_set_webhook' && $text !== '') { $this->handleSetWebhook($uid, $chatId, $text); return; }
         if ($state === 'doc_question' && $text !== '') { $this->handleDocQuestion($uid, $chatId, $text, $user); return; }
         if ($state === 'coding_wait' && $text !== '')  { $this->handleCodingInput($uid, $chatId, $text, $user); return; }
         if ($state === 'tool_wait' && $text !== '')    { $this->handleToolInput($uid, $chatId, $text, $user); return; }
@@ -1940,6 +2000,61 @@ class TelegramBot {
             $sheetUrl = !empty($this->settings->GOOGLE_SHEET_URL) ? $this->settings->GOOGLE_SHEET_URL : null;
             $this->tg->editMessageText($chatId, $msgId, $guide, Keyboards::sheets($sheetUrl));
             $this->tg->answerCallback($cbId);
+        } elseif ($action === 'set_webhook') {
+            $this->states->setState($uid, 'admin_set_webhook');
+            $this->tg->sendMessage($chatId,
+                "🔗 <b>Google Apps Script Webhook URL manzilini yuboring:</b>\n\n" .
+                "Masalan:\n<code>https://script.google.com/macros/s/AKfycb.../exec</code>\n\n" .
+                "Bekor qilish uchun: <b>⬅️ Asosiy menyu</b>",
+                Keyboards::cancel());
+            $this->tg->answerCallback($cbId);
+        }
+    }
+
+    private function handleSetWebhook(int $uid, int $chatId, string $text): void {
+        if (!$this->settings->isAdmin($uid)) return;
+        if ($text === '⬅️ Asosiy menyu') {
+            $this->states->clear($uid);
+            $this->tg->sendMessage($chatId, "Bekor qilindi.", Keyboards::main());
+            return;
+        }
+        $url = trim($text);
+        if (!str_starts_with($url, 'https://script.google.com/macros/s/')) {
+            $this->tg->sendMessage($chatId, "❌ Noto'g'ri havola!\nManzil <code>https://script.google.com/macros/s/.../exec</code> shaklida bo'lishi kerak.\n\nQaytadan yuboring yoki bekor qilish uchun '⬅️ Asosiy menyu' ni bosing.");
+            return;
+        }
+
+        $this->botSettings->set('GOOGLE_SHEETS_WEBHOOK_URL', $url);
+        $this->settings->GOOGLE_SHEETS_WEBHOOK_URL = $url;
+        $this->states->clear($uid);
+
+        $statusMsg = $this->tg->sendMessage($chatId, "⏳ Webhook saqlandi, sinov qatori yuborilmoqda...");
+        $statusId = $statusMsg['result']['message_id'] ?? 0;
+
+        $ok = $this->sheets->log(
+            $uid,
+            'admin',
+            'Admin',
+            '🧪 Webhook Ulandi',
+            'Google Sheets muvaffaqiyatli ulandi!',
+            'Integratsiya faol va ishlayapti!',
+            5,
+            'OK'
+        );
+
+        if ($ok) {
+            $sheetUrl = !empty($this->settings->GOOGLE_SHEET_URL) ? $this->settings->GOOGLE_SHEET_URL : null;
+            $this->tg->editMessageText($chatId, $statusId,
+                "✅ <b>Google Sheets Webhook muvaffaqiyatli sozlandi va faollashtirildi!</b>\n\n" .
+                "Google Sheet jadvalingizga sinov qatori yozildi. Endi barcha amallar jadvalingizda avtomatik ko'rinib boradi.",
+                Keyboards::sheets($sheetUrl));
+        } else {
+            $this->tg->editMessageText($chatId, $statusId,
+                "⚠️ Webhook saqlandi, ammo Google Sheets test so'roviga javob bermadi.\n\n" .
+                "Mumkin bo'lgan sabablar:\n" .
+                "1. Apps Script da <b>Deploy -> New deployment</b> qilinganda <b>Who has access: Anyone</b> tanlanmagan.\n" .
+                "2. URL to'liq nusxalanmagan.\n\n" .
+                "Iltimos, tekshirib qaytadan kiriting.");
         }
     }
 

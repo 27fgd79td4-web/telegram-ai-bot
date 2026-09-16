@@ -99,6 +99,12 @@ CREATE TABLE IF NOT EXISTS activity_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_activity_user ON activity_logs(telegram_user_id);
 CREATE INDEX IF NOT EXISTS idx_activity_date ON activity_logs(created_at);
+
+CREATE TABLE IF NOT EXISTS bot_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL,
+    updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
 ");
 
 echo "✅ Database tayyor: {$dbPath}\n";
