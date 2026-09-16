@@ -83,6 +83,22 @@ CREATE TABLE IF NOT EXISTS files (
     created_at TEXT DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (telegram_user_id) REFERENCES users(telegram_id) ON DELETE CASCADE
 );
+
+CREATE TABLE IF NOT EXISTS activity_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    telegram_user_id INTEGER NOT NULL,
+    username TEXT,
+    full_name TEXT,
+    action TEXT NOT NULL,
+    user_query TEXT,
+    ai_response TEXT,
+    tokens INTEGER DEFAULT 0,
+    status TEXT DEFAULT 'OK',
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (telegram_user_id) REFERENCES users(telegram_id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_activity_user ON activity_logs(telegram_user_id);
+CREATE INDEX IF NOT EXISTS idx_activity_date ON activity_logs(created_at);
 ");
 
 echo "✅ Database tayyor: {$dbPath}\n";

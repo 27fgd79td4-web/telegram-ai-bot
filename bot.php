@@ -75,6 +75,8 @@ class Settings {
     public string $DATABASE_PATH;
     public int $FREE_DAILY_LIMIT;
     public int $MAX_FILE_SIZE_MB;
+    public string $GOOGLE_SHEETS_WEBHOOK_URL;
+    public string $GOOGLE_SHEET_URL;
     public string $TEMP_DIR, $UPLOADS_DIR, $DOWNLOADS_DIR, $DATA_DIR, $LOGS_DIR, $LOG_LEVEL;
 
     public function __construct() {
@@ -83,6 +85,8 @@ class Settings {
         $this->GEMINI_API_KEY       = (string)getEnvVal('GEMINI_API_KEY', (string)getEnvVal('OPENAI_API_KEY', ''));
         $this->GEMINI_MODEL         = (string)getEnvVal('GEMINI_MODEL', 'gemini-3.6-flash');
         $this->GEMINI_TEMPERATURE   = (float)getEnvVal('GEMINI_TEMPERATURE', (float)getEnvVal('OPENAI_TEMPERATURE', 0.7));
+        $this->GOOGLE_SHEETS_WEBHOOK_URL = (string)getEnvVal('GOOGLE_SHEETS_WEBHOOK_URL', '');
+        $this->GOOGLE_SHEET_URL           = (string)getEnvVal('GOOGLE_SHEET_URL', '');
         $this->DATABASE_PATH        = (string)getEnvVal('DATABASE_PATH', './data/bot.db');
         $this->FREE_DAILY_LIMIT     = (int)getEnvVal('FREE_DAILY_LIMIT', 30);
         $this->MAX_FILE_SIZE_MB     = (int)getEnvVal('MAX_FILE_SIZE_MB', 20);
@@ -370,6 +374,62 @@ class FileRepository {
     public function record(int $tid, string $name, string $type, int $size): void {
         $this->pdo->prepare('INSERT INTO files (telegram_user_id, filename, file_type, file_size) VALUES (?,?,?,?)')
             ->execute([$tid, $name, $type, $size]);
+    }
+}
+
+class ActivityLogRepository {
+    public function __construct(private PDO $pdo) {}
+
+    public function record(
+        int $userId,
+        ?string $username,
+        ?string $fullName,
+        string $action,
+        string $query = '',
+        string $response = '',
+        int $tokens = 0,
+        string $status = 'OK'
+    ): int {
+        try {
+            $stmt = $this->pdo->prepare('
+                INSERT INTO activity_logs (telegram_user_id, username, full_name, action, user_query, ai_response, tokens, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ');
+            $stmt->execute([
+                $userId,
+                $username,
+                $fullName,
+                $action,
+                mb_substr($query, 0, 2000),
+                mb_substr($response, 0, 2000),
+                $tokens,
+                $status
+            ]);
+            return (int)$this->pdo->lastInsertId();
+        } catch (Throwable $e) {
+            return 0;
+        }
+    }
+
+    public function getRecent(int $limit = 50): array {
+        try {
+            $stmt = $this->pdo->prepare('
+                SELECT * FROM activity_logs ORDER BY id DESC LIMIT ?
+            ');
+            $stmt->bindValue(1, $limit, PDO::PARAM_INT);
+            $stmt->execute();
+            return array_reverse($stmt->fetchAll());
+        } catch (Throwable $e) {
+            return [];
+        }
+    }
+
+    public function countTotal(): int {
+        try {
+            return (int)$this->pdo->query('SELECT COUNT(*) FROM activity_logs')->fetchColumn();
+        } catch (Throwable $e) {
+            return 0;
+        }
     }
 }
 
@@ -801,6 +861,94 @@ class ImageService {
     }
 }
 
+class GoogleSheetsService {
+    private Client $http;
+
+    public function __construct(
+        private Settings $settings,
+        private ?Logger $logger = null
+    ) {
+        $this->http = new Client([
+            'timeout'         => 4.0,
+            'connect_timeout' => 2.5,
+            'http_errors'     => false,
+        ]);
+    }
+
+    public function isConfigured(): bool {
+        return !empty($this->settings->GOOGLE_SHEETS_WEBHOOK_URL) &&
+               $this->settings->GOOGLE_SHEETS_WEBHOOK_URL !== 'YOUR_GOOGLE_SHEETS_WEBHOOK_URL_HERE';
+    }
+
+    public function log(
+        int $userId,
+        ?string $username,
+        ?string $fullName,
+        string $action,
+        string $query = '',
+        string $response = '',
+        int $tokens = 0,
+        string $status = 'OK'
+    ): bool {
+        if (!$this->isConfigured()) return false;
+
+        $payload = [
+            'timestamp' => Helpers::now(),
+            'user_id'   => $userId,
+            'username'  => $username ?? '',
+            'full_name' => $fullName ?? '',
+            'action'    => $action,
+            'query'     => mb_substr($query, 0, 800),
+            'response'  => mb_substr($response, 0, 800),
+            'tokens'    => $tokens,
+            'status'    => $status,
+        ];
+
+        try {
+            $resp = $this->http->post($this->settings->GOOGLE_SHEETS_WEBHOOK_URL, [
+                'json' => $payload,
+            ]);
+            return $resp->getStatusCode() === 200;
+        } catch (Throwable $e) {
+            if ($this->logger) {
+                $this->logger->error("Google Sheets log xatosi: " . $e->getMessage());
+            }
+            return false;
+        }
+    }
+
+    public function syncBatch(array $logs): int {
+        if (!$this->isConfigured() || empty($logs)) return 0;
+
+        $items = [];
+        foreach ($logs as $l) {
+            $items[] = [
+                'timestamp' => $l['created_at'] ?? Helpers::now(),
+                'user_id'   => $l['telegram_user_id'],
+                'username'  => $l['username'] ?? '',
+                'full_name' => $l['full_name'] ?? '',
+                'action'    => $l['action'] ?? '',
+                'query'     => mb_substr($l['user_query'] ?? '', 0, 800),
+                'response'  => mb_substr($l['ai_response'] ?? '', 0, 800),
+                'tokens'    => (int)($l['tokens'] ?? 0),
+                'status'    => $l['status'] ?? 'OK',
+            ];
+        }
+
+        try {
+            $resp = $this->http->post($this->settings->GOOGLE_SHEETS_WEBHOOK_URL, [
+                'json' => ['batch' => $items],
+            ]);
+            return $resp->getStatusCode() === 200 ? count($items) : 0;
+        } catch (Throwable $e) {
+            if ($this->logger) {
+                $this->logger->error("Google Sheets batch sync xatosi: " . $e->getMessage());
+            }
+            return 0;
+        }
+    }
+}
+
 // ============================================================================
 // 6. KLAVIATURALAR
 // ============================================================================
@@ -911,7 +1059,24 @@ class Keyboards {
              ['text' => '📨 Xabar tarqatish', 'callback_data' => 'admin:broadcast']],
             [['text' => '👥 Foydalanuvchilar', 'callback_data' => 'admin:users'],
              ['text' => '⚙️ Tizim holati', 'callback_data' => 'admin:health']],
+            [['text' => '📈 Google Sheets (Harakatlar)', 'callback_data' => 'admin:sheets']],
         ]];
+    }
+
+    public static function sheets(?string $sheetUrl = null): array {
+        $buttons = [];
+        if (!empty($sheetUrl)) {
+            $buttons[] = [['text' => '🔗 Jadvalni ochish (Google Sheets)', 'url' => $sheetUrl]];
+        }
+        $buttons[] = [
+            ['text' => '🧪 Sinov yuborish (Ping)', 'callback_data' => 'sheets:ping'],
+            ['text' => '📥 Oxirgi 50 ta harakatni yuklash', 'callback_data' => 'sheets:sync'],
+        ];
+        $buttons[] = [
+            ['text' => 'ℹ️ Sozlash qo\'llanmasi', 'callback_data' => 'sheets:guide'],
+            ['text' => '⬅️ Orqaga', 'callback_data' => 'admin:back'],
+        ];
+        return ['inline_keyboard' => $buttons];
     }
 }
 
@@ -981,6 +1146,8 @@ class TelegramBot {
     private MessageRepository $msgs;
     private UsageRepository $usages;
     private FileRepository $files;
+    private ActivityLogRepository $activityLogs;
+    private GoogleSheetsService $sheets;
     private GeminiService $gemini;
     private DocumentService $docService;
     private SpeechService $speechService;
@@ -1009,6 +1176,9 @@ class TelegramBot {
         $this->usages  = new UsageRepository($pdo, $settings);
         $this->files   = new FileRepository($pdo);
 
+        $this->activityLogs  = new ActivityLogRepository($pdo);
+        $this->sheets        = new GoogleSheetsService($settings, $logger);
+
         $this->gemini        = new GeminiService($settings);
         $this->docService    = new DocumentService();
         $this->speechService = new SpeechService($tg, $this->gemini);
@@ -1016,6 +1186,24 @@ class TelegramBot {
 
         $this->states    = new StateManager($settings->DATA_DIR . '/states');
         $this->rateLimit = new RateLimiter(0.8);
+    }
+
+    private function logAction(
+        int $uid,
+        ?string $username,
+        ?string $fullName,
+        string $action,
+        string $query = '',
+        string $response = '',
+        int $tokens = 0,
+        string $status = 'OK'
+    ): void {
+        try {
+            $this->activityLogs->record($uid, $username, $fullName, $action, $query, $response, $tokens, $status);
+            $this->sheets->log($uid, $username, $fullName, $action, $query, $response, $tokens, $status);
+        } catch (Throwable $e) {
+            $this->logger->error("Activity log error: " . $e->getMessage());
+        }
     }
 
     // ------------------------------------------------------------------
@@ -1092,7 +1280,7 @@ class TelegramBot {
         $text = $msg['text'] ?? '';
         if ($text !== '') {
             if ($text === '/start' || $text === '/help')    { $this->cmdStart($chatId, $text === '/help'); return; }
-            if ($text === '/newchat')                       { $this->cmdNewChat($uid, $chatId); return; }
+            if ($text === '/newchat')                       { $this->cmdNewChat($uid, $chatId, $user); return; }
             if ($text === '/history')                       { $this->cmdHistory($uid, $chatId); return; }
             if ($text === '/settings' || $text === '⚙️ Sozlamalar') { $this->cmdSettings($chatId); return; }
             if ($text === '/admin' && $this->settings->isAdmin($uid)) { $this->cmdAdmin($chatId); return; }
@@ -1132,7 +1320,7 @@ class TelegramBot {
                         Keyboards::aiTools());
                     return;
                 case '🗑 Yangi suhbat':
-                    $this->cmdNewChat($uid, $chatId);
+                    $this->cmdNewChat($uid, $chatId, $user);
                     return;
                 case '📚 Tarix':
                     $this->cmdHistory($uid, $chatId);
@@ -1150,9 +1338,9 @@ class TelegramBot {
         // FSM states bo'yicha yo'naltirish
         $state = $this->states->getState($uid);
 
-        if ($state === 'doc_question' && $text !== '') { $this->handleDocQuestion($uid, $chatId, $text); return; }
-        if ($state === 'coding_wait' && $text !== '')  { $this->handleCodingInput($uid, $chatId, $text); return; }
-        if ($state === 'tool_wait' && $text !== '')    { $this->handleToolInput($uid, $chatId, $text); return; }
+        if ($state === 'doc_question' && $text !== '') { $this->handleDocQuestion($uid, $chatId, $text, $user); return; }
+        if ($state === 'coding_wait' && $text !== '')  { $this->handleCodingInput($uid, $chatId, $text, $user); return; }
+        if ($state === 'tool_wait' && $text !== '')    { $this->handleToolInput($uid, $chatId, $text, $user); return; }
         if ($state === 'admin_broadcast')              { $this->handleBroadcast($uid, $msg); return; }
 
         // Fayllar va media
@@ -1162,7 +1350,7 @@ class TelegramBot {
 
         // Umumiy chat
         if ($text !== '' && !str_starts_with($text, '/')) {
-            $this->handleGeneralChat($uid, $chatId, $text);
+            $this->handleGeneralChat($uid, $chatId, $text, $user);
         }
     }
 
@@ -1178,7 +1366,7 @@ class TelegramBot {
         $this->users->getOrCreate($uid, $user['username'] ?? null, $user['first_name'] ?? null);
 
         // Document actions
-        if (str_starts_with($data, 'doc_action:'))  { $this->cbDocAction($uid, $chatId, $msgId, $cb['id'], $data); return; }
+        if (str_starts_with($data, 'doc_action:'))  { $this->cbDocAction($uid, $chatId, $msgId, $cb['id'], $data, $user); return; }
         if (str_starts_with($data, 'code_mode:'))   { $this->cbCodeMode($uid, $chatId, $cb['id'], $data); return; }
         if (str_starts_with($data, 'tool:'))        { $this->cbTool($uid, $chatId, $msgId, $cb['id'], $data); return; }
         if (str_starts_with($data, 'tr_lang:'))     { $this->cbTrLang($uid, $chatId, $cb['id'], $data); return; }
@@ -1187,11 +1375,12 @@ class TelegramBot {
         if ($data === 'settings:language')          { $this->tg->editMessageText($chatId, $msgId, "🌐 Tilni tanlang:", Keyboards::languageSelect()); $this->tg->answerCallback($cb['id']); return; }
         if (str_starts_with($data, 'lang:'))        { $this->cbLang($uid, $chatId, $msgId, $cb['id'], $data); return; }
         if ($data === 'settings:model')             { $this->cbModel($chatId, $msgId, $cb['id']); return; }
-        if ($data === 'settings:clear_history')     { $this->cbClearHistory($uid, $chatId, $msgId, $cb['id']); return; }
+        if ($data === 'settings:clear_history')     { $this->cbClearHistory($uid, $chatId, $msgId, $cb['id'], $user); return; }
         if ($data === 'settings:about')             { $this->cbAbout($chatId, $msgId, $cb['id']); return; }
 
-        // Admin
-        if (str_starts_with($data, 'admin:')) { $this->cbAdmin($uid, $chatId, $msgId, $cb['id'], $data); return; }
+        // Admin & Sheets
+        if (str_starts_with($data, 'admin:'))  { $this->cbAdmin($uid, $chatId, $msgId, $cb['id'], $data); return; }
+        if (str_starts_with($data, 'sheets:')) { $this->cbSheets($uid, $chatId, $msgId, $cb['id'], $data); return; }
 
         $this->tg->answerCallback($cb['id']);
     }
@@ -1222,9 +1411,12 @@ class TelegramBot {
         $this->tg->sendMessage($chatId, $text, Keyboards::main());
     }
 
-    private function cmdNewChat(int $uid, int $chatId): void {
+    private function cmdNewChat(int $uid, int $chatId, ?array $user = null): void {
         $this->states->clear($uid);
         $this->convs->createNew($uid);
+        $uname = $user['username'] ?? null;
+        $fname = trim(($user['first_name'] ?? '') . ' ' . ($user['last_name'] ?? ''));
+        $this->logAction($uid, $uname, $fname, '🗑 Yangi suhbat', '/newchat', 'Yangi suhbat ochildi, xotira tozalandi.', 0, 'OK');
         $this->tg->sendMessage($chatId, "✨ <b>Yangi suhbat boshlandi!</b> Eski xotira tozalandi.", Keyboards::main());
     }
 
@@ -1277,6 +1469,10 @@ class TelegramBot {
             $this->convs->updateTitleIfDefault((int)$conv['id'], $transcription);
             $this->usages->record($uid, 'voice', $res['tokens']);
 
+            $u = $msg['from'] ?? [];
+            $fullName = trim(($u['first_name'] ?? '') . ' ' . ($u['last_name'] ?? ''));
+            $this->logAction($uid, $u['username'] ?? null, $fullName, '🎙 Ovozli xabar', $transcription, $res['content'], $res['tokens'], 'OK');
+
             $this->tg->editMessageText($chatId, $statusId,
                 "📝 <b>Transkripsiya:</b>\n<i>\"{$transcription}\"</i>");
 
@@ -1285,6 +1481,9 @@ class TelegramBot {
             }
         } catch (Throwable $e) {
             $this->logger->error("Voice response error: " . $e->getMessage());
+            $u = $msg['from'] ?? [];
+            $fullName = trim(($u['first_name'] ?? '') . ' ' . ($u['last_name'] ?? ''));
+            $this->logAction($uid, $u['username'] ?? null, $fullName, '🎙 Ovozli xabar', $transcription, $e->getMessage(), 0, 'ERROR');
             $this->tg->sendMessage($chatId, "❌ Ovoz tahlil qilindi, ammo javob berishda xatolik.");
         }
     }
@@ -1309,12 +1508,19 @@ class TelegramBot {
             $this->usages->record($uid, 'image', $res['tokens']);
             $this->tg->deleteMessage($chatId, $statusId);
 
+            $u = $msg['from'] ?? [];
+            $fullName = trim(($u['first_name'] ?? '') . ' ' . ($u['last_name'] ?? ''));
+            $this->logAction($uid, $u['username'] ?? null, $fullName, '🖼 Rasm tahlili', $prompt, $res['content'], $res['tokens'], 'OK');
+
             $prefix = isset($msg['caption']) ? "📝 <i>Izoh: \"{$msg['caption']}\"</i>\n\n" : "";
             foreach (Helpers::splitText("🖼 <b>Rasm tahlili:</b>\n\n{$prefix}{$res['content']}") as $chunk) {
                 $this->tg->sendMessage($chatId, $chunk);
             }
         } catch (Throwable $e) {
             $this->logger->error("Image error: " . $e->getMessage());
+            $u = $msg['from'] ?? [];
+            $fullName = trim(($u['first_name'] ?? '') . ' ' . ($u['last_name'] ?? ''));
+            $this->logAction($uid, $u['username'] ?? null, $fullName, '🖼 Rasm tahlili', $prompt, $e->getMessage(), 0, 'ERROR');
             $this->tg->editMessageText($chatId, $statusId, "❌ Rasmni tahlil qilishda xatolik.");
         }
     }
@@ -1380,7 +1586,7 @@ class TelegramBot {
     // ------------------------------------------------------------------
     // DOC ACTION CALLBACK
     // ------------------------------------------------------------------
-    private function cbDocAction(int $uid, int $chatId, int $msgId, string $cbId, string $data): void {
+    private function cbDocAction(int $uid, int $chatId, int $msgId, string $cbId, string $data, ?array $user = null): void {
         $action = explode(':', $data, 2)[1];
         $stateData = $this->states->getData($uid);
         $docText = $stateData['doc_text'] ?? null;
@@ -1402,10 +1608,14 @@ class TelegramBot {
         $statusMsg = $this->tg->sendMessage($chatId, "🤔 <i>Tahlil qilinmoqda, kuting...</i>");
         $statusId = $statusMsg['result']['message_id'] ?? 0;
 
+        $uname = $user['username'] ?? null;
+        $fname = trim(($user['first_name'] ?? '') . ' ' . ($user['last_name'] ?? ''));
+
         try {
             $res = $this->gemini->analyzeDocument($docText, $action);
             $this->usages->record($uid, 'document', $res['tokens']);
             $this->tg->deleteMessage($chatId, $statusId);
+            $this->logAction($uid, $uname, $fname, "📄 Hujjat: {$action} ({$filename})", "Hujjat tahlili", $res['content'], $res['tokens'], 'OK');
 
             $titles = [
                 'summary' => '📌 Qisqa xulosa', 'deep_analysis' => '🔍 Chuqur tahlil',
@@ -1417,11 +1627,12 @@ class TelegramBot {
             }
         } catch (Throwable $e) {
             $this->logger->error("Doc action error: " . $e->getMessage());
+            $this->logAction($uid, $uname, $fname, "📄 Hujjat: {$action} ({$filename})", "Hujjat tahlili", $e->getMessage(), 0, 'ERROR');
             $this->tg->editMessageText($chatId, $statusId, "❌ Tahlilda xatolik yuz berdi.");
         }
     }
 
-    private function handleDocQuestion(int $uid, int $chatId, string $question): void {
+    private function handleDocQuestion(int $uid, int $chatId, string $question, ?array $user = null): void {
         $data = $this->states->getData($uid);
         $docText = $data['doc_text'] ?? null;
         if (!$docText) {
@@ -1433,14 +1644,19 @@ class TelegramBot {
         $statusMsg = $this->tg->sendMessage($chatId, "🤔 <i>Hujjatdan javob qidirilmoqda...</i>");
         $statusId = $statusMsg['result']['message_id'] ?? 0;
 
+        $uname = $user['username'] ?? null;
+        $fname = trim(($user['first_name'] ?? '') . ' ' . ($user['last_name'] ?? ''));
+
         try {
             $res = $this->gemini->analyzeDocument($docText, 'question', $question);
             $this->usages->record($uid, 'document', $res['tokens']);
             $this->tg->deleteMessage($chatId, $statusId);
+            $this->logAction($uid, $uname, $fname, "📄 Hujjat savoli", $question, $res['content'], $res['tokens'], 'OK');
             foreach (Helpers::splitText("❓ <b>Savol:</b> <i>{$question}</i>\n\n📌 <b>Javob:</b>\n\n" . $res['content']) as $chunk) {
                 $this->tg->sendMessage($chatId, $chunk);
             }
         } catch (Throwable $e) {
+            $this->logAction($uid, $uname, $fname, "📄 Hujjat savoli", $question, $e->getMessage(), 0, 'ERROR');
             $this->tg->editMessageText($chatId, $statusId, "❌ Savolga javob berishda xatolik.");
         }
         $this->states->setState($uid, null);
@@ -1457,7 +1673,7 @@ class TelegramBot {
         $this->tg->sendMessage($chatId, "Endi menga talablaringiz yoki kodingizni yuboring:", Keyboards::cancel());
     }
 
-    private function handleCodingInput(int $uid, int $chatId, string $text): void {
+    private function handleCodingInput(int $uid, int $chatId, string $text, ?array $user = null): void {
         if ($text === '⬅️ Asosiy menyu') {
             $this->states->clear($uid);
             $this->tg->sendMessage($chatId, "Asosiy menyuga qaytdingiz.", Keyboards::main());
@@ -1472,15 +1688,20 @@ class TelegramBot {
         $statusId = $statusMsg['result']['message_id'] ?? 0;
         $this->tg->sendChatAction($chatId, 'typing');
 
+        $uname = $user['username'] ?? null;
+        $fname = trim(($user['first_name'] ?? '') . ' ' . ($user['last_name'] ?? ''));
+
         try {
             $res = $this->gemini->coding($text, $mode);
             $this->usages->record($uid, 'coding', $res['tokens']);
             $this->tg->deleteMessage($chatId, $statusId);
+            $this->logAction($uid, $uname, $fname, "💻 Kod: {$mode}", $text, $res['content'], $res['tokens'], 'OK');
             foreach (Helpers::splitText($res['content']) as $chunk) {
                 $this->tg->sendMessage($chatId, $chunk, null, 'Markdown');
             }
         } catch (Throwable $e) {
             $this->logger->error("Coding error: " . $e->getMessage());
+            $this->logAction($uid, $uname, $fname, "💻 Kod: {$mode}", $text, $e->getMessage(), 0, 'ERROR');
             $this->tg->editMessageText($chatId, $statusId, "❌ Kodni qayta ishlashda xatolik.");
         }
         $this->states->setState($uid, null);
@@ -1527,7 +1748,7 @@ class TelegramBot {
         $this->tg->sendMessage($chatId, "✍️ Uslub: " . ucfirst($style) . ". Matnni yuboring:", Keyboards::cancel());
     }
 
-    private function handleToolInput(int $uid, int $chatId, string $text): void {
+    private function handleToolInput(int $uid, int $chatId, string $text, ?array $user = null): void {
         if ($text === '⬅️ Asosiy menyu') {
             $this->states->clear($uid);
             $this->tg->sendMessage($chatId, "Asosiy menyuga qaytdingiz.", Keyboards::main());
@@ -1548,15 +1769,20 @@ class TelegramBot {
         $statusId = $statusMsg['result']['message_id'] ?? 0;
         $this->tg->sendChatAction($chatId, 'typing');
 
+        $uname = $user['username'] ?? null;
+        $fname = trim(($user['first_name'] ?? '') . ' ' . ($user['last_name'] ?? ''));
+
         try {
             $res = $this->gemini->runTool($tool, $text, $params);
             $this->usages->record($uid, 'tool', $res['tokens']);
             $this->tg->deleteMessage($chatId, $statusId);
+            $this->logAction($uid, $uname, $fname, "🛠 Tool: {$tool}", $text, $res['content'], $res['tokens'], 'OK');
             foreach (Helpers::splitText($res['content']) as $chunk) {
                 $this->tg->sendMessage($chatId, $chunk, null, 'Markdown');
             }
         } catch (Throwable $e) {
             $this->logger->error("Tool error: " . $e->getMessage());
+            $this->logAction($uid, $uname, $fname, "🛠 Tool: {$tool}", $text, $e->getMessage(), 0, 'ERROR');
             $this->tg->editMessageText($chatId, $statusId, "❌ Xatolik yuz berdi.");
         }
         $this->states->setState($uid, null);
@@ -1594,8 +1820,11 @@ class TelegramBot {
         $this->tg->answerCallback($cbId);
     }
 
-    private function cbClearHistory(int $uid, int $chatId, int $msgId, string $cbId): void {
+    private function cbClearHistory(int $uid, int $chatId, int $msgId, string $cbId, ?array $user = null): void {
         $this->convs->createNew($uid, 'Yangi suhbat');
+        $uname = $user['username'] ?? null;
+        $fname = trim(($user['first_name'] ?? '') . ' ' . ($user['last_name'] ?? ''));
+        $this->logAction($uid, $uname, $fname, '🗑 Tarix tozalash', 'settings:clear_history', 'Faol suhbat tozalandi.', 0, 'OK');
         $this->tg->answerCallback($cbId, "Tarix tozalandi!", true);
         $this->tg->editMessageText($chatId, $msgId, "🗑 Faol suhbat tozalandi!", Keyboards::settings());
     }
@@ -1635,11 +1864,83 @@ class TelegramBot {
             $this->tg->editMessageText($chatId, $msgId,
                 "⚙️ <b>Holat:</b> 🟢 Faol\nModel: {$this->settings->GEMINI_MODEL}\nAudio/Vision: 🟢 Faol (Gemini Native)",
                 Keyboards::admin());
+        } elseif ($action === 'sheets') {
+            $configured = $this->sheets->isConfigured();
+            $statusText = $configured ? "🟢 <b>Uланган (Faol)</b>" : "⚪ <b>Ulanmagan (Sozlash kutilmoqda)</b>";
+            $count = $this->activityLogs->countTotal();
+            $sheetUrl = !empty($this->settings->GOOGLE_SHEET_URL) ? $this->settings->GOOGLE_SHEET_URL : null;
+
+            $text = "📈 <b>Google Sheets — Foydalanuvchilar Harakati</b>\n\n" .
+                    "Ushbu bo'limda foydalanuvchilarning barcha so'rovlari, ovozlari, rasmlari va AI javoblari real vaqtda Google Jadvallariga tushib boradi.\n\n" .
+                    "⚙️ <b>Holat:</b> {$statusText}\n" .
+                    "📊 <b>Bazadagi jami harakatlar:</b> <b>{$count}</b> ta\n\n" .
+                    ($configured 
+                        ? "✅ Har bir harakat avtomatik ravishda jadvalga yozilmoqda." 
+                        : "⚠️ <i>Eslatma:</i> Google Sheets webhook sozlanmagan bo'lsa ham, barcha harakatlar SQLite bazasida xavfsiz saqlanib boradi.");
+
+            $this->tg->editMessageText($chatId, $msgId, $text, Keyboards::sheets($sheetUrl));
+        } elseif ($action === 'back') {
+            $this->tg->editMessageText($chatId, $msgId, "👑 <b>Admin Paneli:</b>", Keyboards::admin());
         } elseif ($action === 'broadcast') {
             $this->states->setState($uid, 'admin_broadcast');
             $this->tg->sendMessage($chatId, "📨 Yuboriladigan xabarni kiriting:", Keyboards::cancel());
         }
         $this->tg->answerCallback($cbId);
+    }
+
+    private function cbSheets(int $uid, int $chatId, int $msgId, string $cbId, string $data): void {
+        if (!$this->settings->isAdmin($uid)) { $this->tg->answerCallback($cbId); return; }
+        $action = explode(':', $data, 2)[1] ?? '';
+
+        if ($action === 'ping') {
+            if (!$this->sheets->isConfigured()) {
+                $this->tg->answerCallback($cbId, "⚠️ Google Sheets Webhook sozlanmagan!", true);
+                return;
+            }
+            $this->tg->answerCallback($cbId, "Sinov yuborilmoqda...");
+            $ok = $this->sheets->log(
+                $uid,
+                'admin_test',
+                'Admin Test',
+                '🧪 Sinov (Ping)',
+                'Google Sheets integratsiyasini sinovdan o\'tkazish',
+                'Test muvaffaqiyatli qabul qilindi!',
+                10,
+                'OK'
+            );
+            if ($ok) {
+                $this->tg->sendMessage($chatId, "✅ <b>Sinov yozuvi Google Sheets jadvaliga muvaffaqiyatli yuborildi!</b>\nJadvalingizni tekshirishingiz mumkin.");
+            } else {
+                $this->tg->sendMessage($chatId, "❌ <b>Sinov yozuvini yuborishda xatolik yuz berdi.</b>\nIltimos, Google Apps Script Webhook URL manzili to'g'ri sozlanganini tekshiring.");
+            }
+        } elseif ($action === 'sync') {
+            if (!$this->sheets->isConfigured()) {
+                $this->tg->answerCallback($cbId, "⚠️ Google Sheets Webhook sozlanmagan!", true);
+                return;
+            }
+            $this->tg->answerCallback($cbId, "Sinxronlash boshlandi...");
+            $logs = $this->activityLogs->getRecent(50);
+            if (empty($logs)) {
+                $this->tg->sendMessage($chatId, "ℹ️ Bazada hozircha yozuvlar mavjud emas.");
+                return;
+            }
+            $synced = $this->sheets->syncBatch($logs);
+            $this->tg->sendMessage($chatId, "📥 <b>Sinxronizatsiya yakunlandi!</b>\nGoogle Sheets ga <b>{$synced}</b> ta yozuv yuklandi.");
+        } elseif ($action === 'guide') {
+            $guide = "📋 <b>Google Sheets'ni ulash bo'yicha qo'llanma (1 daqiqa):</b>\n\n" .
+                     "1️⃣ Yangi Google Sheet yarating (<code>sheets.new</code>).\n" .
+                     "2️⃣ Menyudan <b>Extensions -> Apps Script</b> ni bosing.\n" .
+                     "3️⃣ Loyihamizdagi <code>google_sheets_script.js</code> fayli ichidagi kodni nusxalab, Apps Script oynasiga qo'ying va saqlang.\n" .
+                     "4️⃣ <b>Deploy -> New deployment</b> ni bosing:\n" .
+                     "   • Type: <i>Web app</i>\n" .
+                     "   • Execute as: <i>Me</i>\n" .
+                     "   • Who has access: <i>Anyone</i>\n" .
+                     "5️⃣ Olingan <b>Web App URL</b> manzilini <code>.env</code> faylidagi yoki Railway Variables dagi <code>GOOGLE_SHEETS_WEBHOOK_URL</code> ga qo'ying!\n\n" .
+                     "Shuningdek, o'zingiz oson kirishingiz uchun jadval havolasini <code>GOOGLE_SHEET_URL</code> ga qo'yishingiz mumkin.";
+            $sheetUrl = !empty($this->settings->GOOGLE_SHEET_URL) ? $this->settings->GOOGLE_SHEET_URL : null;
+            $this->tg->editMessageText($chatId, $msgId, $guide, Keyboards::sheets($sheetUrl));
+            $this->tg->answerCallback($cbId);
+        }
     }
 
     private function handleBroadcast(int $uid, array $msg): void {
@@ -1675,7 +1976,7 @@ class TelegramBot {
     // ------------------------------------------------------------------
     // UMUMIY CHAT
     // ------------------------------------------------------------------
-    private function handleGeneralChat(int $uid, int $chatId, string $text): void {
+    private function handleGeneralChat(int $uid, int $chatId, string $text, ?array $user = null): void {
         [$ok, $used, $limit] = $this->usages->canRequest($uid);
         if (!$ok) { $this->tg->sendMessage($chatId, "⚠️ Bugungi bepul limit tugadi ({$used}/{$limit})."); return; }
 
@@ -1686,6 +1987,9 @@ class TelegramBot {
         $payload = $history;
         $payload[] = ['role' => 'user', 'content' => $text];
 
+        $uname = $user['username'] ?? null;
+        $fname = trim(($user['first_name'] ?? '') . ' ' . ($user['last_name'] ?? ''));
+
         try {
             $res = $this->gemini->chat($payload);
             $this->msgs->add((int)$conv['id'], 'user', $text);
@@ -1693,11 +1997,14 @@ class TelegramBot {
             $this->convs->updateTitleIfDefault((int)$conv['id'], $text);
             $this->usages->record($uid, 'chat', $res['tokens']);
 
+            $this->logAction($uid, $uname, $fname, '🤖 AI Chat', $text, $res['content'], $res['tokens'], 'OK');
+
             foreach (Helpers::splitText($res['content']) as $chunk) {
                 $this->tg->sendMessage($chatId, $chunk, null, 'Markdown');
             }
         } catch (Throwable $e) {
             $this->logger->error("General chat error: " . $e->getMessage());
+            $this->logAction($uid, $uname, $fname, '🤖 AI Chat', $text, $e->getMessage(), 0, 'ERROR');
             $this->tg->sendMessage($chatId, "❌ Xizmatda texnik muammo yuz berdi.");
         }
     }
