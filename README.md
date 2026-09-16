@@ -13,6 +13,8 @@ Ko'p funksiyali, 100% **Google Gemini API** orqali ishlaydigan zamonaviy Telegra
 - 💻 **Dasturlash yordamchisi**: Kod yozish, xatolarni tuzatish, refaktoring va testlar yaratish.
 - 🛠 **AI Tools**: Professional matn yozish, tarjimon, xulosalash, g'oyalar yaratish, marketing postlari va tahlil.
 - 📈 **Google Sheets Real-Time Monitoring**: Foydalanuvchilarning barcha harakatlari (chat, ovoz, rasm, hujjat, kod, tools) real vaqtda Google Sheets jadvaliga chiroyli dizayn bilan qatorba-qator yozib boriladi.
+- 📑 **PDF & Markdown Eksport**: Har bir foydalanuvchi o'zining suhbat tarixini yoki barcha so'rovlarini rasmiy chiroyli **PDF** va **Markdown (.md)** formatida yuklab olishi mumkin (`/export`).
+- 👑 **Professional Admin Markazi**: Admin uchun to'liq audit hisobotlari (PDF, CSV, MD), foydalanuvchilarni bloklash/blokdan chiqarish (`/block`, `/unblock`), maxsus limitlar berish (`/set_limit`), foydalanuvchi amallarini PDF olish (`/user <id>`) va kesh tozalash (`/cleanup`).
 - 🗄 **SQLite & Limitlar**: Foydalanuvchilar, suhbatlar tarixi va kunlik bepul limitlar boshqaruvi.
 
 ---

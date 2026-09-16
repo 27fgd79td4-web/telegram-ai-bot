@@ -22,6 +22,8 @@ use Smalot\PdfParser\Parser as PdfParser;
 use PhpOffice\PhpWord\IOFactory as WordIOFactory;
 use PhpOffice\PhpSpreadsheet\IOFactory as SpreadsheetIOFactory;
 use PhpOffice\PhpPresentation\IOFactory as PresentationIOFactory;
+use Dompdf\Dompdf;
+use Dompdf\Options;
 
 // ============================================================================
 // SYSTEM PROMPTS
@@ -241,6 +243,28 @@ class UserRepository {
         $s->execute([$since]);
         return (int)$s->fetchColumn();
     }
+    public function blockedCount(): int {
+        return (int)$this->pdo->query('SELECT COUNT(*) FROM users WHERE is_blocked = 1')->fetchColumn();
+    }
+    public function getRecentUsers(int $limit = 15): array {
+        $s = $this->pdo->prepare('SELECT * FROM users ORDER BY last_active DESC LIMIT ?');
+        $s->bindValue(1, $limit, PDO::PARAM_INT);
+        $s->execute();
+        return $s->fetchAll();
+    }
+    public function getByTelegramId(int $tid): ?array {
+        $s = $this->pdo->prepare('SELECT * FROM users WHERE telegram_id = ?');
+        $s->execute([$tid]);
+        return $s->fetch() ?: null;
+    }
+    public function setBlocked(int $tid, bool $blocked): bool {
+        $s = $this->pdo->prepare('UPDATE users SET is_blocked = ? WHERE telegram_id = ?');
+        return $s->execute([$blocked ? 1 : 0, $tid]);
+    }
+    public function setLimitOverride(int $tid, ?int $limit): bool {
+        $s = $this->pdo->prepare('UPDATE users SET daily_limit_override = ? WHERE telegram_id = ?');
+        return $s->execute([$limit, $tid]);
+    }
 }
 
 class ConversationRepository {
@@ -315,6 +339,27 @@ class MessageRepository {
         $s->bindValue(2, $limit, PDO::PARAM_INT);
         $s->execute();
         return array_reverse($s->fetchAll());
+    }
+
+    public function getAllForConversation(int $cid): array {
+        $s = $this->pdo->prepare('SELECT role, content, created_at FROM messages WHERE conversation_id = ? ORDER BY id ASC');
+        $s->execute([$cid]);
+        return $s->fetchAll();
+    }
+
+    public function getAllForUser(int $uid, int $limit = 200): array {
+        $s = $this->pdo->prepare('
+            SELECT m.role, m.content, m.created_at, c.title as conversation_title
+            FROM messages m
+            JOIN conversations c ON m.conversation_id = c.id
+            WHERE c.telegram_user_id = ?
+            ORDER BY m.id ASC
+            LIMIT ?
+        ');
+        $s->bindValue(1, $uid, PDO::PARAM_INT);
+        $s->bindValue(2, $limit, PDO::PARAM_INT);
+        $s->execute();
+        return $s->fetchAll();
     }
 }
 
@@ -431,6 +476,42 @@ class ActivityLogRepository {
             return 0;
         }
     }
+
+    public function getUserActivities(int $uid, int $limit = 100): array {
+        try {
+            $stmt = $this->pdo->prepare('
+                SELECT * FROM activity_logs WHERE telegram_user_id = ? ORDER BY id DESC LIMIT ?
+            ');
+            $stmt->bindValue(1, $uid, PDO::PARAM_INT);
+            $stmt->bindValue(2, $limit, PDO::PARAM_INT);
+            $stmt->execute();
+            return array_reverse($stmt->fetchAll());
+        } catch (Throwable) {
+            return [];
+        }
+    }
+
+    public function getAllForAudit(int $limit = 1000, bool $todayOnly = false): array {
+        try {
+            if ($todayOnly) {
+                $todayStart = date('Y-m-d 00:00:00');
+                $stmt = $this->pdo->prepare('
+                    SELECT * FROM activity_logs WHERE created_at >= ? ORDER BY id DESC LIMIT ?
+                ');
+                $stmt->bindValue(1, $todayStart);
+                $stmt->bindValue(2, $limit, PDO::PARAM_INT);
+            } else {
+                $stmt = $this->pdo->prepare('
+                    SELECT * FROM activity_logs ORDER BY id DESC LIMIT ?
+                ');
+                $stmt->bindValue(1, $limit, PDO::PARAM_INT);
+            }
+            $stmt->execute();
+            return array_reverse($stmt->fetchAll());
+        } catch (Throwable) {
+            return [];
+        }
+    }
 }
 
 class SettingsRepository {
@@ -519,6 +600,33 @@ class TelegramAPI {
             return file_exists($savePath);
         } catch (GuzzleException $e) {
             return false;
+        }
+    }
+    public function sendDocument(int $chatId, string $filePath, ?string $caption = null, ?array $replyMarkup = null): array {
+        try {
+            if (!file_exists($filePath)) {
+                return ['ok' => false, 'description' => 'Fayl topilmadi: ' . $filePath];
+            }
+            $multipart = [
+                ['name' => 'chat_id', 'contents' => (string)$chatId],
+                [
+                    'name'     => 'document',
+                    'contents' => fopen($filePath, 'r'),
+                    'filename' => basename($filePath),
+                ],
+            ];
+            if ($caption !== null) {
+                $multipart[] = ['name' => 'caption', 'contents' => $caption];
+                $multipart[] = ['name' => 'parse_mode', 'contents' => 'HTML'];
+            }
+            if ($replyMarkup !== null) {
+                $multipart[] = ['name' => 'reply_markup', 'contents' => json_encode($replyMarkup, JSON_UNESCAPED_UNICODE)];
+            }
+            $r = $this->http->post('sendDocument', ['multipart' => $multipart]);
+            $data = json_decode((string)$r->getBody(), true);
+            return $data ?? ['ok' => false];
+        } catch (GuzzleException $e) {
+            return ['ok' => false, 'description' => $e->getMessage()];
         }
     }
 }
@@ -983,6 +1091,348 @@ class GoogleSheetsService {
     }
 }
 
+class ExportService {
+    public function __construct(private string $tempDir) {
+        if (!is_dir($this->tempDir)) @mkdir($this->tempDir, 0777, true);
+    }
+
+    private function renderPdf(string $html, string $outputPath, string $orientation = 'portrait'): bool {
+        try {
+            $options = new Options();
+            $options->set('isHtml5ParserEnabled', true);
+            $options->set('isRemoteEnabled', true);
+            $options->set('defaultFont', 'DejaVu Sans');
+
+            $dompdf = new Dompdf($options);
+            $dompdf->loadHtml($html, 'UTF-8');
+            $dompdf->setPaper('A4', $orientation);
+            $dompdf->render();
+
+            file_put_contents($outputPath, $dompdf->output());
+            return file_exists($outputPath) && filesize($outputPath) > 0;
+        } catch (Throwable $e) {
+            return false;
+        }
+    }
+
+    public function exportUserMessagesPdf(int $uid, string $userName, array $messages, string $title): ?string {
+        $now = date('d.m.Y H:i:s');
+        $total = count($messages);
+        $safeTitle = htmlspecialchars($title, ENT_QUOTES, 'UTF-8');
+        $safeName = htmlspecialchars($userName, ENT_QUOTES, 'UTF-8');
+
+        $itemsHtml = '';
+        foreach ($messages as $m) {
+            $isUser = $m['role'] === 'user';
+            $cls = $isUser ? 'msg-user' : 'msg-ai';
+            $badge = $isUser ? '<span class="badge badge-user">👤 Foydalanuvchi</span>' : '<span class="badge badge-ai">🤖 AI Assistant</span>';
+            $time = htmlspecialchars($m['created_at'] ?? $now, ENT_QUOTES, 'UTF-8');
+            $body = nl2br(htmlspecialchars($m['content'], ENT_QUOTES, 'UTF-8'));
+
+            $itemsHtml .= "
+            <div class='msg-card {$cls}'>
+                <div class='msg-meta'>{$badge} &nbsp; <span style='color:#64748b; font-weight:normal;'>{$time}</span></div>
+                <div class='msg-body'>{$body}</div>
+            </div>";
+        }
+
+        if ($itemsHtml === '') {
+            $itemsHtml = "<p style='color:#64748b; text-align:center;'>Ushbu suhbatda hali xabarlar mavjud emas.</p>";
+        }
+
+        $html = "
+        <!DOCTYPE html>
+        <html lang='uz'>
+        <head>
+        <meta charset='UTF-8'>
+        <style>
+            @page { margin: 25px 25px 35px 25px; }
+            body { font-family: 'DejaVu Sans', sans-serif; font-size: 11px; color: #1e293b; line-height: 1.5; margin: 0; padding: 0; }
+            .header { background: #0f172a; color: #ffffff; padding: 18px 20px; border-radius: 8px; margin-bottom: 20px; }
+            .header h1 { margin: 0 0 6px 0; font-size: 18px; color: #38bdf8; }
+            .header .meta { font-size: 10px; color: #94a3b8; }
+            .badge { display: inline-block; padding: 3px 8px; font-size: 9px; font-weight: bold; border-radius: 4px; }
+            .badge-user { background: #e0f2fe; color: #0369a1; }
+            .badge-ai { background: #dcfce7; color: #15803d; }
+            .msg-card { border: 1px solid #e2e8f0; border-radius: 6px; padding: 10px 14px; margin-bottom: 12px; }
+            .msg-user { background: #f8fafc; border-left: 4px solid #0284c7; }
+            .msg-ai { background: #ffffff; border-left: 4px solid #10b981; }
+            .msg-meta { font-size: 10px; color: #64748b; margin-bottom: 6px; font-weight: bold; }
+            .msg-body { font-size: 10.5px; word-wrap: break-word; }
+            .footer { position: fixed; bottom: -20px; left: 0; right: 0; text-align: center; font-size: 9px; color: #94a3b8; }
+        </style>
+        </head>
+        <body>
+            <div class='header'>
+                <h1>🤖 Universal AI Assistant — Suhbat Hisoboti</h1>
+                <div class='meta'>
+                    Suhbat mavzusi: <b>{$safeTitle}</b> &nbsp;|&nbsp; 
+                    Foydalanuvchi: <b>{$safeName}</b> (ID: {$uid}) &nbsp;|&nbsp; 
+                    Jami xabarlar: <b>{$total}</b> ta &nbsp;|&nbsp; 
+                    Sana: {$now}
+                </div>
+            </div>
+            {$itemsHtml}
+            <div class='footer'>Universal AI Assistant Bot (@assistanduzz_bot) — Shaxsiy suhbat hisoboti</div>
+        </body>
+        </html>";
+
+        $path = rtrim($this->tempDir, '/') . '/chat_' . $uid . '_' . time() . '.pdf';
+        return $this->renderPdf($html, $path) ? $path : null;
+    }
+
+    public function exportUserMessagesMd(int $uid, string $userName, array $messages, string $title): ?string {
+        $now = date('d.m.Y H:i:s');
+        $md = "# 🤖 Universal AI Assistant — Suhbat Tarixi\n\n";
+        $md .= "- **Suhbat mavzusi:** {$title}\n";
+        $md .= "- **Foydalanuvchi:** {$userName} (ID: `{$uid}`)\n";
+        $md .= "- **Eksport sanasi:** {$now}\n";
+        $md .= "- **Xabarlar soni:** " . count($messages) . " ta\n\n";
+        $md .= "---\n\n";
+
+        foreach ($messages as $m) {
+            $role = $m['role'] === 'user' ? '👤 Foydalanuvchi' : '🤖 AI Assistant';
+            $time = $m['created_at'] ?? $now;
+            $md .= "### {$role} ({$time})\n\n";
+            $md .= trim($m['content']) . "\n\n";
+            $md .= "---\n\n";
+        }
+
+        $path = rtrim($this->tempDir, '/') . '/chat_' . $uid . '_' . time() . '.md';
+        file_put_contents($path, $md);
+        return file_exists($path) ? $path : null;
+    }
+
+    public function exportUserActivitiesPdf(int $uid, string $userName, array $activities): ?string {
+        $now = date('d.m.Y H:i:s');
+        $safeName = htmlspecialchars($userName, ENT_QUOTES, 'UTF-8');
+        $total = count($activities);
+
+        $rows = '';
+        $i = 1;
+        foreach ($activities as $a) {
+            $time = htmlspecialchars($a['created_at'] ?? '', ENT_QUOTES, 'UTF-8');
+            $action = htmlspecialchars($a['action'] ?? '', ENT_QUOTES, 'UTF-8');
+            $query = nl2br(htmlspecialchars(mb_substr($a['user_query'] ?? '', 0, 300), ENT_QUOTES, 'UTF-8'));
+            $resp = nl2br(htmlspecialchars(mb_substr($a['ai_response'] ?? '', 0, 400), ENT_QUOTES, 'UTF-8'));
+            $tok = number_format((int)($a['tokens'] ?? 0));
+            $st = $a['status'] === 'ERROR' ? '<span class="badge badge-err">ERROR</span>' : '<span class="badge badge-ok">OK</span>';
+
+            $rows .= "<tr>
+                <td style='text-align:center;'>{$i}</td>
+                <td>{$time}</td>
+                <td><b>{$action}</b></td>
+                <td>{$query}</td>
+                <td>{$resp}</td>
+                <td style='text-align:center;'>{$tok}</td>
+                <td style='text-align:center;'>{$st}</td>
+            </tr>";
+            $i++;
+        }
+
+        $html = "
+        <!DOCTYPE html>
+        <html lang='uz'>
+        <head>
+        <meta charset='UTF-8'>
+        <style>
+            @page { margin: 20px; }
+            body { font-family: 'DejaVu Sans', sans-serif; font-size: 9.5px; color: #1e293b; line-height: 1.4; }
+            .header { background: #0f172a; color: #ffffff; padding: 14px 18px; border-radius: 6px; margin-bottom: 15px; }
+            .header h1 { margin: 0 0 4px 0; font-size: 16px; color: #38bdf8; }
+            .header .meta { font-size: 9.5px; color: #94a3b8; }
+            .badge { display: inline-block; padding: 2px 6px; font-size: 8.5px; font-weight: bold; border-radius: 3px; }
+            .badge-ok { background: #dcfce7; color: #166534; }
+            .badge-err { background: #fee2e2; color: #991b1b; }
+            table { width: 100%; border-collapse: collapse; }
+            th { background: #1e293b; color: #ffffff; padding: 7px 5px; font-size: 9px; text-align: left; }
+            td { padding: 6px 5px; border-bottom: 1px solid #e2e8f0; font-size: 8.5px; vertical-align: top; }
+            tr:nth-child(even) td { background: #f8fafc; }
+            .footer { position: fixed; bottom: -15px; left: 0; right: 0; text-align: center; font-size: 8px; color: #94a3b8; }
+        </style>
+        </head>
+        <body>
+            <div class='header'>
+                <h1>📊 Foydalanuvchi Amallari Tarixi</h1>
+                <div class='meta'>
+                    Foydalanuvchi: <b>{$safeName}</b> (ID: {$uid}) &nbsp;|&nbsp; 
+                    Jami amallar: <b>{$total}</b> ta &nbsp;|&nbsp; 
+                    Sana: {$now}
+                </div>
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th style='width:25px; text-align:center;'>#</th>
+                        <th style='width:90px;'>Vaqt</th>
+                        <th style='width:90px;'>Bo'lim</th>
+                        <th style='width:180px;'>So'rov</th>
+                        <th>Javob xulosasi</th>
+                        <th style='width:45px; text-align:center;'>Token</th>
+                        <th style='width:40px; text-align:center;'>Status</th>
+                    </tr>
+                </thead>
+                <tbody>{$rows}</tbody>
+            </table>
+            <div class='footer'>Universal AI Assistant Bot (@assistanduzz_bot) — Barcha huquqlar himoyalangan</div>
+        </body>
+        </html>";
+
+        $path = rtrim($this->tempDir, '/') . '/activity_' . $uid . '_' . time() . '.pdf';
+        return $this->renderPdf($html, $path, 'landscape') ? $path : null;
+    }
+
+    public function exportAdminAuditPdf(array $activities, string $title, bool $todayOnly = false): ?string {
+        $now = date('d.m.Y H:i:s');
+        $safeTitle = htmlspecialchars($title, ENT_QUOTES, 'UTF-8');
+        $total = count($activities);
+
+        $totalTokens = 0;
+        $successCount = 0;
+        $uniqueUsers = [];
+
+        foreach ($activities as $a) {
+            $totalTokens += (int)($a['tokens'] ?? 0);
+            if (($a['status'] ?? '') === 'OK') $successCount++;
+            $uniqueUsers[$a['telegram_user_id']] = true;
+        }
+
+        $userCount = count($uniqueUsers);
+        $successRate = $total > 0 ? round(($successCount / $total) * 100, 1) : 100;
+
+        $rows = '';
+        $i = 1;
+        foreach ($activities as $a) {
+            $time = htmlspecialchars($a['created_at'] ?? '', ENT_QUOTES, 'UTF-8');
+            $user = htmlspecialchars(($a['full_name'] ?: ($a['username'] ? '@' . $a['username'] : 'User')) . " ({$a['telegram_user_id']})", ENT_QUOTES, 'UTF-8');
+            $action = htmlspecialchars($a['action'] ?? '', ENT_QUOTES, 'UTF-8');
+            $query = nl2br(htmlspecialchars(mb_substr($a['user_query'] ?? '', 0, 220), ENT_QUOTES, 'UTF-8'));
+            $resp = nl2br(htmlspecialchars(mb_substr($a['ai_response'] ?? '', 0, 300), ENT_QUOTES, 'UTF-8'));
+            $tok = number_format((int)($a['tokens'] ?? 0));
+            $st = $a['status'] === 'ERROR' ? '<span class="badge badge-err">ERR</span>' : '<span class="badge badge-ok">OK</span>';
+
+            $rows .= "<tr>
+                <td style='text-align:center;'>{$i}</td>
+                <td>{$time}</td>
+                <td><b>{$user}</b></td>
+                <td>{$action}</td>
+                <td>{$query}</td>
+                <td>{$resp}</td>
+                <td style='text-align:center;'>{$tok}</td>
+                <td style='text-align:center;'>{$st}</td>
+            </tr>";
+            $i++;
+        }
+
+        $html = "
+        <!DOCTYPE html>
+        <html lang='uz'>
+        <head>
+        <meta charset='UTF-8'>
+        <style>
+            @page { margin: 18px; }
+            body { font-family: 'DejaVu Sans', sans-serif; font-size: 9px; color: #1e293b; line-height: 1.35; }
+            .header { background: #0f172a; color: #ffffff; padding: 14px 18px; border-radius: 6px; margin-bottom: 12px; }
+            .header h1 { margin: 0 0 5px 0; font-size: 16px; color: #38bdf8; }
+            .stats-bar { margin-top: 8px; font-size: 9.5px; }
+            .stat-pill { display: inline-block; background: #1e293b; padding: 4px 10px; border-radius: 4px; margin-right: 8px; color: #f8fafc; }
+            .stat-pill b { color: #38bdf8; }
+            .badge { display: inline-block; padding: 2px 5px; font-size: 8px; font-weight: bold; border-radius: 3px; }
+            .badge-ok { background: #dcfce7; color: #166534; }
+            .badge-err { background: #fee2e2; color: #991b1b; }
+            table { width: 100%; border-collapse: collapse; }
+            th { background: #1e293b; color: #ffffff; padding: 6px 4px; font-size: 8.5px; text-align: left; }
+            td { padding: 5px 4px; border-bottom: 1px solid #e2e8f0; font-size: 8px; vertical-align: top; }
+            tr:nth-child(even) td { background: #f8fafc; }
+            .footer { position: fixed; bottom: -12px; left: 0; right: 0; text-align: center; font-size: 8px; color: #94a3b8; }
+        </style>
+        </head>
+        <body>
+            <div class='header'>
+                <h1>👑 {$safeTitle}</h1>
+                <div class='stats-bar'>
+                    <div class='stat-pill'>Jami amallar: <b>{$total}</b></div>
+                    <div class='stat-pill'>Foydalanuvchilar: <b>{$userCount}</b></div>
+                    <div class='stat-pill'>Jami tokenlar: <b>" . number_format($totalTokens) . "</b></div>
+                    <div class='stat-pill'>Muvaffaqiyat: <b>{$successRate}%</b></div>
+                    <div class='stat-pill' style='float:right;'>Sana: {$now}</div>
+                </div>
+            </div>
+            <table>
+                <thead>
+                    <tr>
+                        <th style='width:22px; text-align:center;'>#</th>
+                        <th style='width:80px;'>Vaqt</th>
+                        <th style='width:120px;'>Foydalanuvchi</th>
+                        <th style='width:80px;'>Amal turi</th>
+                        <th style='width:160px;'>So'rov</th>
+                        <th>AI Javobi / Natija</th>
+                        <th style='width:40px; text-align:center;'>Token</th>
+                        <th style='width:35px; text-align:center;'>Status</th>
+                    </tr>
+                </thead>
+                <tbody>{$rows}</tbody>
+            </table>
+            <div class='footer'>Universal AI Assistant Bot (@assistanduzz_bot) — Administrator Audit Hisoboti</div>
+        </body>
+        </html>";
+
+        $prefix = $todayOnly ? 'today_audit_' : 'full_audit_';
+        $path = rtrim($this->tempDir, '/') . '/' . $prefix . time() . '.pdf';
+        return $this->renderPdf($html, $path, 'landscape') ? $path : null;
+    }
+
+    public function exportAdminAuditCsv(array $activities): ?string {
+        $path = rtrim($this->tempDir, '/') . '/audit_' . time() . '.csv';
+        $fp = fopen($path, 'w');
+        if (!$fp) return null;
+
+        // UTF-8 BOM for Microsoft Excel compatibility
+        fwrite($fp, "\xEF\xBB\xBF");
+
+        fputcsv($fp, ['ID', 'Sana & Vaqt', 'Telegram ID', 'Username', 'FIO', 'Amal Turi', 'Foydalanuvchi So\'rovi', 'AI Javobi', 'Tokenlar', 'Status']);
+
+        foreach ($activities as $a) {
+            fputcsv($fp, [
+                $a['id'] ?? '',
+                $a['created_at'] ?? '',
+                $a['telegram_user_id'] ?? '',
+                $a['username'] ? '@' . $a['username'] : '',
+                $a['full_name'] ?? '',
+                $a['action'] ?? '',
+                $a['user_query'] ?? '',
+                $a['ai_response'] ?? '',
+                $a['tokens'] ?? 0,
+                $a['status'] ?? 'OK',
+            ]);
+        }
+
+        fclose($fp);
+        return file_exists($path) ? $path : null;
+    }
+
+    public function exportAdminAuditMd(array $activities, string $title): ?string {
+        $now = date('d.m.Y H:i:s');
+        $md = "# 👑 {$title}\n\n";
+        $md .= "- **Eksport sanasi:** {$now}\n";
+        $md .= "- **Jami yozuvlar:** " . count($activities) . " ta\n\n";
+        $md .= "| ID | Sana | User ID | Username | FIO | Amal | So'rov | Token | Status |\n";
+        $md .= "|:---|:---|:---|:---|:---|:---|:---|:---|:---|\n";
+
+        foreach ($activities as $a) {
+            $uname = $a['username'] ? '@' . $a['username'] : '—';
+            $fname = str_replace('|', '/', $a['full_name'] ?? '—');
+            $action = str_replace('|', '/', $a['action'] ?? '');
+            $query = str_replace(["\r", "\n", '|'], [' ', ' ', '/'], mb_substr($a['user_query'] ?? '', 0, 80));
+            $md .= "| {$a['id']} | {$a['created_at']} | `{$a['telegram_user_id']}` | {$uname} | {$fname} | {$action} | {$query} | {$a['tokens']} | {$a['status']} |\n";
+        }
+
+        $path = rtrim($this->tempDir, '/') . '/audit_' . time() . '.md';
+        file_put_contents($path, $md);
+        return file_exists($path) ? $path : null;
+    }
+}
+
 // ============================================================================
 // 6. KLAVIATURALAR
 // ============================================================================
@@ -1065,8 +1515,19 @@ class Keyboards {
         return ['inline_keyboard' => [
             [['text' => '🌐 Tilni tanlash', 'callback_data' => 'settings:language'],
              ['text' => '🧠 AI Model', 'callback_data' => 'settings:model']],
+            [['text' => '📥 Tarixni yuklab olish (PDF/MD)', 'callback_data' => 'settings:export']],
             [['text' => '🗑 Tarixni tozalash', 'callback_data' => 'settings:clear_history'],
              ['text' => 'ℹ️ Bot haqida', 'callback_data' => 'settings:about']],
+        ]];
+    }
+
+    public static function userExport(): array {
+        return ['inline_keyboard' => [
+            [['text' => '📑 Faol suhbatni PDF yuklash', 'callback_data' => 'export:chat_pdf'],
+             ['text' => '📝 Faol suhbatni MD yuklash', 'callback_data' => 'export:chat_md']],
+            [['text' => '📊 Barcha amallarim (PDF)', 'callback_data' => 'export:user_all_pdf'],
+             ['text' => '📝 Barcha amallarim (MD)', 'callback_data' => 'export:user_all_md']],
+            [['text' => '⬅️ Orqaga', 'callback_data' => 'export:back_to_settings']],
         ]];
     }
 
@@ -1084,16 +1545,32 @@ class Keyboards {
             $icon = $c['is_active'] ? '🟢 ' : '⚪ ';
             $rows[] = [['text' => $icon . mb_substr($c['title'], 0, 25), 'callback_data' => 'switch_conv:' . $c['id']]];
         }
+        $rows[] = [
+            ['text' => '📑 PDF yuklab olish', 'callback_data' => 'export:chat_pdf'],
+            ['text' => '📝 MD yuklab olish', 'callback_data' => 'export:chat_md'],
+        ];
         return ['inline_keyboard' => $rows];
     }
 
     public static function admin(): array {
         return ['inline_keyboard' => [
-            [['text' => '📊 Statistika', 'callback_data' => 'admin:stats'],
+            [['text' => '📊 Kengaytirilgan Statistika', 'callback_data' => 'admin:stats'],
              ['text' => '📨 Xabar tarqatish', 'callback_data' => 'admin:broadcast']],
             [['text' => '👥 Foydalanuvchilar', 'callback_data' => 'admin:users'],
              ['text' => '⚙️ Tizim holati', 'callback_data' => 'admin:health']],
-            [['text' => '📈 Google Sheets (Harakatlar)', 'callback_data' => 'admin:sheets']],
+            [['text' => '📥 Hisobotlarni Eksport qilish (PDF/CSV)', 'callback_data' => 'admin:exports']],
+            [['text' => '📈 Google Sheets', 'callback_data' => 'admin:sheets'],
+             ['text' => '🧹 Keshni tozalash', 'callback_data' => 'admin:cleanup']],
+        ]];
+    }
+
+    public static function adminExports(): array {
+        return ['inline_keyboard' => [
+            [['text' => '📑 Barcha amallar (PDF hisobot)', 'callback_data' => 'admin_exp:all_pdf']],
+            [['text' => '📊 Excel / CSV yuklab olish', 'callback_data' => 'admin_exp:all_csv'],
+             ['text' => '📝 Markdown (.md) hisobot', 'callback_data' => 'admin_exp:all_md']],
+            [['text' => '📅 Bugungi amallar (PDF)', 'callback_data' => 'admin_exp:today_pdf']],
+            [['text' => '⬅️ Orqaga', 'callback_data' => 'admin:back']],
         ]];
     }
 
@@ -1185,6 +1662,7 @@ class TelegramBot {
     private FileRepository $files;
     private ActivityLogRepository $activityLogs;
     private SettingsRepository $botSettings;
+    private ExportService $exporter;
     private GoogleSheetsService $sheets;
     private GeminiService $gemini;
     private DocumentService $docService;
@@ -1216,6 +1694,7 @@ class TelegramBot {
 
         $this->activityLogs  = new ActivityLogRepository($pdo);
         $this->botSettings   = new SettingsRepository($pdo);
+        $this->exporter      = new ExportService($settings->TEMP_DIR);
 
         $savedWebhook = $this->botSettings->get('GOOGLE_SHEETS_WEBHOOK_URL');
         if (!empty($savedWebhook)) {
@@ -1317,8 +1796,13 @@ class TelegramBot {
         $chatId = (int)$msg['chat']['id'];
 
         // Auth + rate limit
-        $this->users->getOrCreate($uid, $user['username'] ?? null, $user['first_name'] ?? null,
+        $dbUser = $this->users->getOrCreate($uid, $user['username'] ?? null, $user['first_name'] ?? null,
                                   $user['language_code'] ?? 'uz');
+
+        if (!empty($dbUser['is_blocked']) && !$this->settings->isAdmin($uid)) {
+            $this->tg->sendMessage($chatId, "⛔ <b>Hisobingiz bloklangan!</b>\nSavollar bo'yicha administratorga murojaat qiling.");
+            return;
+        }
 
         if ($this->rateLimit->check($uid) && !$this->settings->isAdmin($uid)) {
             $this->tg->sendMessage($chatId, "⚠️ Iltimos, biroz kuting.");
@@ -1331,6 +1815,7 @@ class TelegramBot {
             if ($text === '/start' || $text === '/help')    { $this->cmdStart($chatId, $text === '/help'); return; }
             if ($text === '/newchat')                       { $this->cmdNewChat($uid, $chatId, $user); return; }
             if ($text === '/history')                       { $this->cmdHistory($uid, $chatId); return; }
+            if ($text === '/export' || $text === '/pdf')    { $this->tg->sendMessage($chatId, "📥 <b>Suhbat yoki amallar tarixingizni yuklab olish:</b>\n\nKerakli formatni tanlang 👇", Keyboards::userExport()); return; }
             if ($text === '/settings' || $text === '⚙️ Sozlamalar') { $this->cmdSettings($chatId); return; }
             if ($text === '/admin' && $this->settings->isAdmin($uid)) { $this->cmdAdmin($chatId); return; }
             if (str_starts_with($text, '/set_sheets') && $this->settings->isAdmin($uid)) {
@@ -1342,6 +1827,48 @@ class TelegramBot {
                 }
                 $this->handleSetWebhook($uid, $chatId, $url);
                 return;
+            }
+            if ($this->settings->isAdmin($uid)) {
+                if (str_starts_with($text, '/block ')) {
+                    $targetId = (int)trim(substr($text, 7));
+                    $this->users->setBlocked($targetId, true);
+                    $this->tg->sendMessage($chatId, "⛔ Foydalanuvchi <code>{$targetId}</code> muvaffaqiyatli bloklandi.");
+                    return;
+                }
+                if (str_starts_with($text, '/unblock ')) {
+                    $targetId = (int)trim(substr($text, 9));
+                    $this->users->setBlocked($targetId, false);
+                    $this->tg->sendMessage($chatId, "✅ Foydalanuvchi <code>{$targetId}</code> blokdan chiqarildi.");
+                    return;
+                }
+                if (str_starts_with($text, '/set_limit ')) {
+                    $p = preg_split('/\s+/', trim($text));
+                    if (count($p) >= 3) {
+                        $targetId = (int)$p[1];
+                        $limit = (int)$p[2];
+                        $this->users->setLimitOverride($targetId, $limit);
+                        $this->tg->sendMessage($chatId, "✅ Foydalanuvchi <code>{$targetId}</code> uchun kunlik limit <b>{$limit}</b> ta etib belgilandi.");
+                        return;
+                    }
+                }
+                if (str_starts_with($text, '/set_daily_limit ')) {
+                    $newLimit = (int)trim(substr($text, 17));
+                    if ($newLimit > 0) {
+                        $this->botSettings->set('FREE_DAILY_LIMIT', (string)$newLimit);
+                        $this->settings->FREE_DAILY_LIMIT = $newLimit;
+                        $this->tg->sendMessage($chatId, "✅ Barcha foydalanuvchilar uchun umumiy kunlik limit <b>{$newLimit}</b> ta etib yangilandi.");
+                        return;
+                    }
+                }
+                if (str_starts_with($text, '/user ')) {
+                    $targetId = (int)trim(substr($text, 6));
+                    $this->cmdUserInspect($chatId, $targetId);
+                    return;
+                }
+                if ($text === '/cleanup') {
+                    $this->cmdCleanup($chatId);
+                    return;
+                }
             }
 
             // Menyu tugmalari
@@ -1437,6 +1964,10 @@ class TelegramBot {
         if ($data === 'settings:model')             { $this->cbModel($chatId, $msgId, $cb['id']); return; }
         if ($data === 'settings:clear_history')     { $this->cbClearHistory($uid, $chatId, $msgId, $cb['id'], $user); return; }
         if ($data === 'settings:about')             { $this->cbAbout($chatId, $msgId, $cb['id']); return; }
+        if ($data === 'settings:export')            { $this->tg->editMessageText($chatId, $msgId, "📥 <b>Suhbat yoki amallar tarixingizni yuklab olish:</b>\n\nKerakli formatni tanlang 👇", Keyboards::userExport()); $this->tg->answerCallback($cb['id']); return; }
+        if ($data === 'export:back_to_settings')    { $this->tg->editMessageText($chatId, $msgId, "⚙️ <b>Bot Sozlamalari:</b>", Keyboards::settings()); $this->tg->answerCallback($cb['id']); return; }
+        if (str_starts_with($data, 'export:'))      { $this->cbUserExport($uid, $chatId, $msgId, $cb['id'], $data, $user); return; }
+        if (str_starts_with($data, 'admin_exp:'))   { $this->cbAdminExport($uid, $chatId, $msgId, $cb['id'], $data); return; }
 
         // Admin & Sheets
         if (str_starts_with($data, 'admin:'))  { $this->cbAdmin($uid, $chatId, $msgId, $cb['id'], $data); return; }
@@ -1919,7 +2450,31 @@ class TelegramBot {
         } elseif ($action === 'users') {
             $total = $this->users->totalCount();
             $active = $this->users->activeCount(1);
-            $this->tg->editMessageText($chatId, $msgId, "👥 Jami: {$total} ta | 24 soatda faol: {$active} ta", Keyboards::admin());
+            $blocked = $this->users->blockedCount();
+            $recents = $this->users->getRecentUsers(8);
+
+            $userList = '';
+            foreach ($recents as $ru) {
+                $uname = $ru['username'] ? '@' . $ru['username'] : '—';
+                $name = htmlspecialchars(mb_substr($ru['first_name'] ?? 'User', 0, 15), ENT_QUOTES, 'UTF-8');
+                $st = !empty($ru['is_blocked']) ? '🔴' : '🟢';
+                $userList .= "• {$st} <b>{$name}</b> ({$uname}) — <code>{$ru['telegram_id']}</code>\n";
+            }
+
+            $t = "👥 <b>Foydalanuvchilar Boshqaruvi:</b>\n\n" .
+                 "📊 Jami: <b>{$total}</b> ta | 24 soatda faol: <b>{$active}</b> ta | Bloklangan: <b>{$blocked}</b> ta\n\n" .
+                 "<b>Oxirgi faol foydalanuvchilar:</b>\n{$userList}\n" .
+                 "💡 <b>Tezkor buyruqlar:</b>\n" .
+                 "• <code>/user &lt;id&gt;</code> — Foydalanuvchi ma'lumoti & amallarini PDF olish\n" .
+                 "• <code>/block &lt;id&gt;</code> — Bloklash\n" .
+                 "• <code>/unblock &lt;id&gt;</code> — Blokdan chiqarish\n" .
+                 "• <code>/set_limit &lt;id&gt; &lt;soni&gt;</code> — Maxsus limit berish";
+
+            $this->tg->editMessageText($chatId, $msgId, $t, Keyboards::admin());
+        } elseif ($action === 'exports') {
+            $this->tg->editMessageText($chatId, $msgId, "📥 <b>Hisobotlarni Eksport Qilish Markazi:</b>\n\nKerakli formatni tanlang 👇", Keyboards::adminExports());
+        } elseif ($action === 'cleanup') {
+            $this->cmdCleanup($chatId, $msgId);
         } elseif ($action === 'health') {
             $this->tg->editMessageText($chatId, $msgId,
                 "⚙️ <b>Holat:</b> 🟢 Faol\nModel: {$this->settings->GEMINI_MODEL}\nAudio/Vision: 🟢 Faol (Gemini Native)",
@@ -2086,6 +2641,185 @@ class TelegramBot {
 
         $this->tg->editMessageText($chatId, $statusId,
             "✅ Yetkazildi: {$delivered} ta | Xato/Blok: {$failed} ta\nJami: " . count($ids) . " ta");
+    }
+
+    // ------------------------------------------------------------------
+    // EKSPORT VA ADMIN BOSHQARUV HANDLERLARI
+    // ------------------------------------------------------------------
+    private function cbUserExport(int $uid, int $chatId, int $msgId, string $cbId, string $data, array $user): void {
+        $action = explode(':', $data, 2)[1] ?? '';
+        $uname = $user['username'] ? '@' . $user['username'] : ($user['first_name'] ?? 'Foydalanuvchi');
+
+        if ($action === 'chat_pdf' || $action === 'chat_md') {
+            $conv = $this->convs->getOrCreateActive($uid);
+            $messages = $this->msgs->getAllForConversation((int)$conv['id']);
+            if (empty($messages)) {
+                $this->tg->answerCallback($cbId, "Faol suhbatda hali xabarlar yo'q.", true);
+                return;
+            }
+
+            $this->tg->answerCallback($cbId, "Hujjat tayyorlanmoqda...");
+
+            if ($action === 'chat_pdf') {
+                $file = $this->exporter->exportUserMessagesPdf($uid, $uname, $messages, $conv['title'] ?? 'AI Suhbat');
+                if ($file) {
+                    $this->tg->sendDocument($chatId, $file, "📑 <b>\"{$conv['title']}\" suhbat hisoboti (PDF)</b>\n\nUniversal AI Assistant Bot tomonidan tayyorlandi.");
+                    @unlink($file);
+                } else {
+                    $this->tg->sendMessage($chatId, "❌ PDF faylni shakllantirishda xatolik yuz berdi.");
+                }
+            } else {
+                $file = $this->exporter->exportUserMessagesMd($uid, $uname, $messages, $conv['title'] ?? 'AI Suhbat');
+                if ($file) {
+                    $this->tg->sendDocument($chatId, $file, "📝 <b>\"{$conv['title']}\" suhbat hisoboti (Markdown)</b>\n\nUniversal AI Assistant Bot tomonidan tayyorlandi.");
+                    @unlink($file);
+                } else {
+                    $this->tg->sendMessage($chatId, "❌ Markdown faylni shakllantirishda xatolik yuz berdi.");
+                }
+            }
+        } elseif ($action === 'user_all_pdf' || $action === 'user_all_md') {
+            $activities = $this->activityLogs->getUserActivities($uid, 100);
+            if (empty($activities)) {
+                $this->tg->answerCallback($cbId, "Hali birorta amal qayd etilmagan.", true);
+                return;
+            }
+
+            $this->tg->answerCallback($cbId, "Hujjat tayyorlanmoqda...");
+
+            if ($action === 'user_all_pdf') {
+                $file = $this->exporter->exportUserActivitiesPdf($uid, $uname, $activities);
+                if ($file) {
+                    $this->tg->sendDocument($chatId, $file, "📊 <b>Sizning barcha amallaringiz hisoboti (PDF)</b>\n\nUniversal AI Assistant Bot tomonidan tayyorlandi.");
+                    @unlink($file);
+                } else {
+                    $this->tg->sendMessage($chatId, "❌ PDF faylni shakllantirishda xatolik yuz berdi.");
+                }
+            } else {
+                $file = $this->exporter->exportUserActivitiesMd($uid, $uname, $activities);
+                if ($file) {
+                    $this->tg->sendDocument($chatId, $file, "📝 <b>Sizning barcha amallaringiz hisoboti (Markdown)</b>\n\nUniversal AI Assistant Bot tomonidan tayyorlandi.");
+                    @unlink($file);
+                } else {
+                    $this->tg->sendMessage($chatId, "❌ Markdown faylni shakllantirishda xatolik yuz berdi.");
+                }
+            }
+        }
+    }
+
+    private function cbAdminExport(int $uid, int $chatId, int $msgId, string $cbId, string $data): void {
+        if (!$this->settings->isAdmin($uid)) { $this->tg->answerCallback($cbId); return; }
+        $action = explode(':', $data, 2)[1] ?? '';
+
+        $this->tg->answerCallback($cbId, "Hisobot tayyorlanmoqda...");
+
+        if ($action === 'all_pdf') {
+            $activities = $this->activityLogs->getAllForAudit(1000);
+            if (empty($activities)) {
+                $this->tg->sendMessage($chatId, "ℹ️ Bazada yozuvlar mavjud emas.");
+                return;
+            }
+            $file = $this->exporter->exportAdminAuditPdf($activities, "Barcha Foydalanuvchilar Harakatlari Audit Hisoboti");
+            if ($file) {
+                $this->tg->sendDocument($chatId, $file, "👑 <b>Barcha harakatlar hisoboti (PDF)</b>\n\nJami: " . count($activities) . " ta yozuv.");
+                @unlink($file);
+            }
+        } elseif ($action === 'all_csv') {
+            $activities = $this->activityLogs->getAllForAudit(1500);
+            if (empty($activities)) {
+                $this->tg->sendMessage($chatId, "ℹ️ Bazada yozuvlar mavjud emas.");
+                return;
+            }
+            $file = $this->exporter->exportAdminAuditCsv($activities);
+            if ($file) {
+                $this->tg->sendDocument($chatId, $file, "📊 <b>Excel / CSV hisoboti</b>\n\nUshbu faylni Excel yoki Google Sheets'da to'g'ridan-to'g'ri ochishingiz mumkin.");
+                @unlink($file);
+            }
+        } elseif ($action === 'all_md') {
+            $activities = $this->activityLogs->getAllForAudit(1000);
+            if (empty($activities)) {
+                $this->tg->sendMessage($chatId, "ℹ️ Bazada yozuvlar mavjud emas.");
+                return;
+            }
+            $file = $this->exporter->exportAdminAuditMd($activities, "Foydalanuvchilar Harakatlari Hisoboti");
+            if ($file) {
+                $this->tg->sendDocument($chatId, $file, "📝 <b>Markdown hisoboti (.md)</b>");
+                @unlink($file);
+            }
+        } elseif ($action === 'today_pdf') {
+            $activities = $this->activityLogs->getAllForAudit(500, true);
+            if (empty($activities)) {
+                $this->tg->sendMessage($chatId, "ℹ️ Bugun hali birorta harakat qayd etilmagan.");
+                return;
+            }
+            $file = $this->exporter->exportAdminAuditPdf($activities, "Bugungi Harakatlar Audit Hisoboti", true);
+            if ($file) {
+                $this->tg->sendDocument($chatId, $file, "📅 <b>Bugungi kunlik audit hisoboti (PDF)</b>\n\nJami: " . count($activities) . " ta yozuv.");
+                @unlink($file);
+            }
+        }
+    }
+
+    private function cmdCleanup(int $chatId, ?int $msgId = null): void {
+        $deleted = 0;
+        $freedBytes = 0;
+        foreach ([$this->settings->TEMP_DIR, $this->settings->DOWNLOADS_DIR] as $dir) {
+            if (is_dir($dir)) {
+                foreach (glob($dir . '/*') as $f) {
+                    if (is_file($f)) {
+                        $freedBytes += filesize($f);
+                        @unlink($f);
+                        $deleted++;
+                    }
+                }
+            }
+        }
+        $freedMb = round($freedBytes / (1024 * 1024), 2);
+        $text = "🧹 <b>Tizim keshini tozalash yakunlandi!</b>\n\n" .
+                "🗑 O'chirilgan vaqtinchalik fayllar: <b>{$deleted}</b> ta\n" .
+                "💾 Bo'shatilgan joy: <b>{$freedMb} MB</b>";
+        if ($msgId) {
+            $this->tg->editMessageText($chatId, $msgId, $text, Keyboards::admin());
+        } else {
+            $this->tg->sendMessage($chatId, $text, Keyboards::admin());
+        }
+    }
+
+    private function cmdUserInspect(int $chatId, int $targetId): void {
+        $u = $this->users->getByTelegramId($targetId);
+        if (!$u) {
+            $this->tg->sendMessage($chatId, "❌ Foydalanuvchi `{$targetId}` topilmadi.");
+            return;
+        }
+
+        $activities = $this->activityLogs->getUserActivities($targetId, 50);
+        $actCount = count($activities);
+        $status = !empty($u['is_blocked']) ? "🔴 Bloklangan" : "🟢 Faol";
+        $limit = $u['daily_limit_override'] !== null ? "{$u['daily_limit_override']} ta (maxsus)" : "Standart ({$this->settings->FREE_DAILY_LIMIT})";
+
+        $text = "👤 <b>Foydalanuvchi Ma'lumotlari:</b>\n\n" .
+                "🆔 Telegram ID: <code>{$u['telegram_id']}</code>\n" .
+                "👤 Ismi: <b>" . htmlspecialchars($u['first_name'] ?? '—', ENT_QUOTES, 'UTF-8') . "</b>\n" .
+                "🌐 Username: @" . ($u['username'] ?? '—') . "\n" .
+                "🛡 Holati: {$status}\n" .
+                "⚡ Kunlik limit: <b>{$limit}</b>\n" .
+                "📅 Ro'yxatdan o'tgan: {$u['created_at']}\n" .
+                "🕒 Oxirgi faollik: {$u['last_active']}\n" .
+                "📊 Jami amallari: <b>{$actCount}</b> ta\n\n" .
+                "<b>Boshqaruv buyruqlari:</b>\n" .
+                "• <code>/block {$targetId}</code> — Bloklash\n" .
+                "• <code>/unblock {$targetId}</code> — Blokdan chiqarish\n" .
+                "• <code>/set_limit {$targetId} 50</code> — Limit belgilash";
+
+        $this->tg->sendMessage($chatId, $text);
+
+        if (!empty($activities)) {
+            $name = $u['username'] ? '@' . $u['username'] : ($u['first_name'] ?? 'User');
+            $file = $this->exporter->exportUserActivitiesPdf($targetId, $name, $activities);
+            if ($file) {
+                $this->tg->sendDocument($chatId, $file, "📑 <b>Foydalanuvchi `{$targetId}` amallari to'liq hisoboti (PDF)</b>");
+                @unlink($file);
+            }
+        }
     }
 
     // ------------------------------------------------------------------
