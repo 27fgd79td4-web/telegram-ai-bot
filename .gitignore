@@ -1,0 +1,24 @@
+# Environment variables & secrets
+.env
+.env.*
+!.env.example
+
+# Composer
+/vendor/
+composer.phar
+composer.zip
+
+# Runtime / User data
+/data/
+/downloads/
+/logs/
+/temp/
+/uploads/
+*.db
+*.sqlite
+
+# System / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

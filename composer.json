@@ -1,0 +1,20 @@
+{
+    "name": "universal/telegram-ai-bot",
+    "description": "Universal Telegram AI Assistant Bot (PHP)",
+    "type": "project",
+    "require": {
+        "php": ">=8.1",
+        "vlucas/phpdotenv": "^5.6",
+        "guzzlehttp/guzzle": "^7.8",
+        "smalot/pdfparser": "^2.9",
+        "phpoffice/phpword": "^1.4",
+        "phpoffice/phpspreadsheet": "^2.1",
+        "phpoffice/phppresentation": "^1.0"
+    },
+    "config": {
+        "optimize-autoloader": true,
+        "allow-plugins": {
+            "*": true
+        }
+    }
+}
