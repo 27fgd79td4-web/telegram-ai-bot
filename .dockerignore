@@ -1,0 +1,11 @@
+.git
+.env
+vendor
+data
+downloads
+logs
+temp
+uploads
+composer.phar
+composer.zip
+*.md

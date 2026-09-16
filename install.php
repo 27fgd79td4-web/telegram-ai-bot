@@ -11,10 +11,15 @@ use Dotenv\Dotenv;
 $dotenv = Dotenv::createImmutable(__DIR__);
 if (file_exists(__DIR__ . '/.env')) $dotenv->load();
 
-$dbPath = $_ENV['DATABASE_PATH'] ?? './data/bot.db';
-$dataDir = $_ENV['DATA_DIR'] ?? './data';
-foreach ([$dataDir, $_ENV['TEMP_DIR'] ?? './temp', $_ENV['LOGS_DIR'] ?? './logs',
-          $_ENV['UPLOADS_DIR'] ?? './uploads', $_ENV['DOWNLOADS_DIR'] ?? './downloads'] as $d) {
+function getEnvVal(string $key, mixed $default = null): mixed {
+    $val = $_ENV[$key] ?? $_SERVER[$key] ?? getenv($key);
+    return ($val !== false && $val !== null && $val !== '') ? $val : $default;
+}
+
+$dbPath = (string)getEnvVal('DATABASE_PATH', './data/bot.db');
+$dataDir = (string)getEnvVal('DATA_DIR', './data');
+foreach ([$dataDir, (string)getEnvVal('TEMP_DIR', './temp'), (string)getEnvVal('LOGS_DIR', './logs'),
+          (string)getEnvVal('UPLOADS_DIR', './uploads'), (string)getEnvVal('DOWNLOADS_DIR', './downloads')] as $d) {
     if (!is_dir($d)) mkdir($d, 0777, true);
 }
 

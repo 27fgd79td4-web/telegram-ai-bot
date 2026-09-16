@@ -69,6 +69,11 @@ EOT;
 $dotenv = Dotenv::createImmutable(__DIR__);
 if (file_exists(__DIR__ . '/.env')) $dotenv->load();
 
+function getEnvVal(string $key, mixed $default = null): mixed {
+    $val = $_ENV[$key] ?? $_SERVER[$key] ?? getenv($key);
+    return ($val !== false && $val !== null && $val !== '') ? $val : $default;
+}
+
 class Settings {
     public string $BOT_TOKEN;
     public int $ADMIN_ID;
@@ -82,21 +87,21 @@ class Settings {
     public string $TEMP_DIR, $UPLOADS_DIR, $DOWNLOADS_DIR, $DATA_DIR, $LOGS_DIR, $LOG_LEVEL;
 
     public function __construct() {
-        $this->BOT_TOKEN            = $_ENV['BOT_TOKEN']            ?? '';
-        $this->ADMIN_ID             = (int)($_ENV['ADMIN_ID']        ?? 0);
-        $this->OPENAI_API_KEY       = $_ENV['OPENAI_API_KEY']        ?? '';
-        $this->OPENAI_MODEL         = $_ENV['OPENAI_MODEL']          ?? 'gpt-4o-mini';
-        $this->OPENAI_WHISPER_MODEL = $_ENV['OPENAI_WHISPER_MODEL']  ?? 'whisper-1';
-        $this->OPENAI_TEMPERATURE   = (float)($_ENV['OPENAI_TEMPERATURE'] ?? 0.7);
-        $this->DATABASE_PATH        = $_ENV['DATABASE_PATH']         ?? './data/bot.db';
-        $this->FREE_DAILY_LIMIT     = (int)($_ENV['FREE_DAILY_LIMIT'] ?? 30);
-        $this->MAX_FILE_SIZE_MB     = (int)($_ENV['MAX_FILE_SIZE_MB'] ?? 20);
-        $this->TEMP_DIR             = $_ENV['TEMP_DIR']              ?? './temp';
-        $this->UPLOADS_DIR          = $_ENV['UPLOADS_DIR']           ?? './uploads';
-        $this->DOWNLOADS_DIR        = $_ENV['DOWNLOADS_DIR']         ?? './downloads';
-        $this->DATA_DIR             = $_ENV['DATA_DIR']              ?? './data';
-        $this->LOGS_DIR             = $_ENV['LOGS_DIR']              ?? './logs';
-        $this->LOG_LEVEL            = $_ENV['LOG_LEVEL']             ?? 'INFO';
+        $this->BOT_TOKEN            = (string)getEnvVal('BOT_TOKEN', '');
+        $this->ADMIN_ID             = (int)getEnvVal('ADMIN_ID', 0);
+        $this->OPENAI_API_KEY       = (string)getEnvVal('OPENAI_API_KEY', '');
+        $this->OPENAI_MODEL         = (string)getEnvVal('OPENAI_MODEL', 'gpt-4o-mini');
+        $this->OPENAI_WHISPER_MODEL = (string)getEnvVal('OPENAI_WHISPER_MODEL', 'whisper-1');
+        $this->OPENAI_TEMPERATURE   = (float)getEnvVal('OPENAI_TEMPERATURE', 0.7);
+        $this->DATABASE_PATH        = (string)getEnvVal('DATABASE_PATH', './data/bot.db');
+        $this->FREE_DAILY_LIMIT     = (int)getEnvVal('FREE_DAILY_LIMIT', 30);
+        $this->MAX_FILE_SIZE_MB     = (int)getEnvVal('MAX_FILE_SIZE_MB', 20);
+        $this->TEMP_DIR             = (string)getEnvVal('TEMP_DIR', './temp');
+        $this->UPLOADS_DIR          = (string)getEnvVal('UPLOADS_DIR', './uploads');
+        $this->DOWNLOADS_DIR        = (string)getEnvVal('DOWNLOADS_DIR', './downloads');
+        $this->DATA_DIR             = (string)getEnvVal('DATA_DIR', './data');
+        $this->LOGS_DIR             = (string)getEnvVal('LOGS_DIR', './logs');
+        $this->LOG_LEVEL            = (string)getEnvVal('LOG_LEVEL', 'INFO');
         foreach ([$this->TEMP_DIR, $this->UPLOADS_DIR, $this->DOWNLOADS_DIR, $this->DATA_DIR, $this->LOGS_DIR] as $d)
             if (!is_dir($d)) mkdir($d, 0777, true);
     }
@@ -665,7 +670,7 @@ class SpeechService {
     ) {}
 
     public function processVoice(string $fileId, string $ext = 'ogg'): array {
-        $tempPath = rtrim($_ENV['TEMP_DIR'] ?? './temp', '/') . '/voice_' . Helpers::uuid() . '.' . $ext;
+        $tempPath = rtrim((string)getEnvVal('TEMP_DIR', './temp'), '/') . '/voice_' . Helpers::uuid() . '.' . $ext;
         try {
             $filePath = $this->tg->getFile($fileId);
             if (!$filePath) return [null, "Ovozli faylni yuklab bo'lmadi."];
@@ -691,7 +696,7 @@ class ImageService {
     ) {}
 
     public function processPhoto(string $fileId, string $prompt): array {
-        $tempPath = rtrim($_ENV['TEMP_DIR'] ?? './temp', '/') . '/photo_' . Helpers::uuid() . '.jpg';
+        $tempPath = rtrim((string)getEnvVal('TEMP_DIR', './temp'), '/') . '/photo_' . Helpers::uuid() . '.jpg';
         try {
             $filePath = $this->tg->getFile($fileId);
             if (!$filePath) throw new RuntimeException('Rasmni yuklab bo\'lmadi.');
