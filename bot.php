@@ -5,7 +5,7 @@
  * ============================================================================
  * Texnologiyalar:
  *  - PHP 8.1+
- *  - GuzzleHTTP (Telegram & OpenAI)
+ *  - GuzzleHTTP (Telegram & Google Gemini)
  *  - SQLite (PDO)
  *  - PDF/DOCX/XLSX/PPTX parsers
  * ============================================================================
@@ -24,39 +24,31 @@ use PhpOffice\PhpSpreadsheet\IOFactory as SpreadsheetIOFactory;
 use PhpOffice\PhpPresentation\IOFactory as PresentationIOFactory;
 
 // ============================================================================
-// 0. PROMPTS
+// SYSTEM PROMPTS
 // ============================================================================
 
 class Prompts {
-    public const SYSTEM = <<<'EOT'
-You are a professional multilingual AI assistant.
-Your goal is to provide accurate, useful, clear and practical answers.
-Never fabricate facts. If uncertain, state it clearly.
-Adapt to user's language (Uzbek, Russian, English).
-For programming, provide clean, runnable code.
-Be concise when simple, detailed when depth is needed.
+    public const SYSTEM = <<<EOT
+Siz Universal AI Assistant — Telegram bot orqali ishlaydigan aqlli, samimiy va professional yordamchisiz.
+Asosiy vazifangiz: foydalanuvchilarning savollariga aniq, tushunarli va chiroyli formatlangan javob berish.
+Javoblaringizda Telegram HTML formatidan (<b>, <i>, <code>, <pre>) unumli foydalaning.
+O'zbek tilida ravon gapiring. Zarur bo'lsa boshqa tillarda ham javob bera olasiz.
 EOT;
 
-    public const DOCUMENT = <<<'EOT'
-You are an expert Document Analyst AI Assistant.
-Analyze documents thoroughly: core message, structure, facts, numbers, dates.
-Distinguish facts from interpretation. Identify risks and contradictions.
-Provide actionable recommendations. Never fabricate.
-Adapt to user's language. Format cleanly for Telegram.
+    public const DOCUMENT = <<<EOT
+Siz hujjatlarni tahlil qilish bo'yicha professional ekspertsiz.
+Berilgan hujjat matnini sinchkovlik bilan o'rganib, aniq faktlarga asoslangan xulosalar bering.
 EOT;
 
-    public const CODING = <<<'EOT'
-You are a Principal Software Engineer and Code Architect.
-Provide production-grade, maintainable, secure code.
-Include complete runnable code blocks with syntax highlighting.
-For debugging: root cause, why, fix, prevention.
-Respond in user's language (Uzbek, Russian, English).
+    public const CODING = <<<EOT
+Siz tajribali Senior Software Engineer siz.
+Toza, xavfsiz va samarali kod yozasiz. Har bir qismni tushuntirib berasiz.
+Format: Kodni ```til ko'rinishida bering.
 EOT;
 
-    public const TOOLS = <<<'EOT'
-You are a specialized AI Multi-Tool Engine.
-Execute tasks with maximum quality: text generation, translation,
-summarization, ideas, rewriting, marketing, study assistance, data analysis.
+    public const TOOLS = <<<EOT
+You are an advanced text and language processing specialist.
+Provide high quality, well structured and concise output.
 Adapt to user's language.
 EOT;
 }
@@ -77,10 +69,9 @@ function getEnvVal(string $key, mixed $default = null): mixed {
 class Settings {
     public string $BOT_TOKEN;
     public int $ADMIN_ID;
-    public string $OPENAI_API_KEY;
-    public string $OPENAI_MODEL;
-    public string $OPENAI_WHISPER_MODEL;
-    public float $OPENAI_TEMPERATURE;
+    public string $GEMINI_API_KEY;
+    public string $GEMINI_MODEL;
+    public float $GEMINI_TEMPERATURE;
     public string $DATABASE_PATH;
     public int $FREE_DAILY_LIMIT;
     public int $MAX_FILE_SIZE_MB;
@@ -89,10 +80,9 @@ class Settings {
     public function __construct() {
         $this->BOT_TOKEN            = (string)getEnvVal('BOT_TOKEN', '');
         $this->ADMIN_ID             = (int)getEnvVal('ADMIN_ID', 0);
-        $this->OPENAI_API_KEY       = (string)getEnvVal('OPENAI_API_KEY', '');
-        $this->OPENAI_MODEL         = (string)getEnvVal('OPENAI_MODEL', 'gpt-4o-mini');
-        $this->OPENAI_WHISPER_MODEL = (string)getEnvVal('OPENAI_WHISPER_MODEL', 'whisper-1');
-        $this->OPENAI_TEMPERATURE   = (float)getEnvVal('OPENAI_TEMPERATURE', 0.7);
+        $this->GEMINI_API_KEY       = (string)getEnvVal('GEMINI_API_KEY', (string)getEnvVal('OPENAI_API_KEY', ''));
+        $this->GEMINI_MODEL         = (string)getEnvVal('GEMINI_MODEL', 'gemini-3.6-flash');
+        $this->GEMINI_TEMPERATURE   = (float)getEnvVal('GEMINI_TEMPERATURE', (float)getEnvVal('OPENAI_TEMPERATURE', 0.7));
         $this->DATABASE_PATH        = (string)getEnvVal('DATABASE_PATH', './data/bot.db');
         $this->FREE_DAILY_LIMIT     = (int)getEnvVal('FREE_DAILY_LIMIT', 30);
         $this->MAX_FILE_SIZE_MB     = (int)getEnvVal('MAX_FILE_SIZE_MB', 20);
@@ -439,15 +429,16 @@ class TelegramAPI {
     }
 }
 
-class OpenAIService {
+class GeminiService {
     private Client $http;
+
     public function __construct(private Settings $settings) {
         $this->http = new Client([
-            'base_uri' => 'https://api.openai.com/v1/',
-            'timeout' => 120,
-            'headers' => [
-                'Authorization' => 'Bearer ' . $settings->OPENAI_API_KEY,
-                'Content-Type' => 'application/json',
+            'base_uri' => 'https://generativelanguage.googleapis.com/v1beta/',
+            'timeout'  => 120,
+            'headers'  => [
+                'x-goog-api-key' => $settings->GEMINI_API_KEY,
+                'Content-Type'   => 'application/json',
             ],
         ]);
     }
@@ -457,57 +448,157 @@ class OpenAIService {
             $r = $this->http->post($path, ['json' => $body]);
             return json_decode((string)$r->getBody(), true) ?? [];
         } catch (GuzzleException $e) {
-            throw new RuntimeException('OpenAI xatosi: ' . $e->getMessage());
+            $errMsg = $e->getMessage();
+            if (method_exists($e, 'getResponse') && $e->getResponse()) {
+                $errBody = (string)$e->getResponse()->getBody();
+                $errData = json_decode($errBody, true);
+                if (isset($errData['error']['message'])) {
+                    $errMsg = $errData['error']['message'];
+                }
+            }
+            throw new RuntimeException('Gemini xatosi: ' . $errMsg);
         }
+    }
+
+    private function extractTextAndTokens(array $data): array {
+        $content = '';
+        if (isset($data['candidates'][0]['content']['parts'])) {
+            foreach ($data['candidates'][0]['content']['parts'] as $part) {
+                if (isset($part['text'])) {
+                    $content .= $part['text'];
+                }
+            }
+        }
+        $tokens = $data['usageMetadata']['totalTokenCount'] ?? 0;
+        return [
+            'content' => $content,
+            'tokens'  => $tokens,
+        ];
     }
 
     public function chat(array $messages, ?string $systemPrompt = null, ?float $temp = null): array {
-        $full = [['role' => 'system', 'content' => $systemPrompt ?? Prompts::SYSTEM]];
-        foreach ($messages as $m) $full[] = $m;
+        $contents = [];
+        foreach ($messages as $m) {
+            $role = ($m['role'] === 'assistant' || $m['role'] === 'model') ? 'model' : 'user';
+            $text = trim((string)($m['content'] ?? ''));
+            if ($text === '') continue;
 
-        $data = $this->post('chat/completions', [
-            'model' => $this->settings->OPENAI_MODEL,
-            'messages' => $full,
-            'temperature' => $temp ?? $this->settings->OPENAI_TEMPERATURE,
-        ]);
-        return [
-            'content' => $data['choices'][0]['message']['content'] ?? '',
-            'tokens'  => $data['usage']['total_tokens'] ?? 0,
+            $count = count($contents);
+            if ($count > 0 && $contents[$count - 1]['role'] === $role) {
+                $contents[$count - 1]['parts'][0]['text'] .= "\n" . $text;
+            } else {
+                $contents[] = [
+                    'role'  => $role,
+                    'parts' => [['text' => $text]],
+                ];
+            }
+        }
+
+        if (!empty($contents) && $contents[0]['role'] === 'model') {
+            array_unshift($contents, [
+                'role'  => 'user',
+                'parts' => [['text' => 'Salom']],
+            ]);
+        }
+
+        $body = [
+            'contents' => $contents,
+            'generationConfig' => [
+                'temperature' => $temp ?? $this->settings->GEMINI_TEMPERATURE,
+            ],
         ];
+
+        $sys = $systemPrompt ?? Prompts::SYSTEM;
+        if (!empty($sys)) {
+            $body['systemInstruction'] = [
+                'parts' => [['text' => $sys]],
+            ];
+        }
+
+        $model = !empty($this->settings->GEMINI_MODEL) ? $this->settings->GEMINI_MODEL : 'gemini-3.6-flash';
+        $endpoint = 'models/' . urlencode($model) . ':generateContent';
+        $data = $this->post($endpoint, $body);
+        return $this->extractTextAndTokens($data);
     }
 
     public function transcribe(string $audioPath): string {
-        try {
-            $r = $this->http->post('audio/transcriptions', [
-                'multipart' => [
-                    ['name' => 'file', 'contents' => fopen($audioPath, 'r')],
-                    ['name' => 'model', 'contents' => $this->settings->OPENAI_WHISPER_MODEL],
-                ],
-            ]);
-            $d = json_decode((string)$r->getBody(), true);
-            return trim($d['text'] ?? '');
-        } catch (GuzzleException $e) {
-            throw new RuntimeException('Whisper xatosi: ' . $e->getMessage());
+        if (!file_exists($audioPath) || filesize($audioPath) === 0) {
+            throw new RuntimeException("Ovozli fayl topilmadi yoki bo'sh.");
         }
+
+        $ext = strtolower(pathinfo($audioPath, PATHINFO_EXTENSION));
+        $mimeMap = [
+            'ogg'  => 'audio/ogg',
+            'oga'  => 'audio/ogg',
+            'mp3'  => 'audio/mp3',
+            'wav'  => 'audio/wav',
+            'm4a'  => 'audio/m4a',
+            'aac'  => 'audio/aac',
+            'flac' => 'audio/flac',
+        ];
+        $mimeType = $mimeMap[$ext] ?? 'audio/ogg';
+
+        $b64 = base64_encode(file_get_contents($audioPath));
+
+        $body = [
+            'contents' => [
+                [
+                    'role'  => 'user',
+                    'parts' => [
+                        [
+                            'inlineData' => [
+                                'mimeType' => $mimeType,
+                                'data'     => $b64,
+                            ],
+                        ],
+                        [
+                            'text' => "Iltimos, ushbu audio yozuvdagi barcha so'zlarni eshitganingizdek aniq matnga aylantiring (transkripsiya qiling). Faqat audio ichidagi aytilgan gaplarni yozing, hech qanday kirish so'zlari, izoh yoki tarjima qo'shmang.",
+                        ],
+                    ],
+                ],
+            ],
+            'generationConfig' => [
+                'temperature' => 0.1,
+            ],
+        ];
+
+        $model = !empty($this->settings->GEMINI_MODEL) ? $this->settings->GEMINI_MODEL : 'gemini-3.6-flash';
+        $endpoint = 'models/' . urlencode($model) . ':generateContent';
+        $data = $this->post($endpoint, $body);
+        $res = $this->extractTextAndTokens($data);
+        return trim($res['content']);
     }
 
-    public function analyzeImage(string $base64, string $prompt): array {
-        $messages = [
-            ['role' => 'system', 'content' => Prompts::SYSTEM],
-            ['role' => 'user', 'content' => [
-                ['type' => 'text', 'text' => $prompt],
-                ['type' => 'image_url', 'image_url' => ['url' => "data:image/jpeg;base64,{$base64}"]],
-            ]],
+    public function analyzeImage(string $base64, string $prompt, string $mimeType = 'image/jpeg'): array {
+        $body = [
+            'contents' => [
+                [
+                    'role'  => 'user',
+                    'parts' => [
+                        [
+                            'inlineData' => [
+                                'mimeType' => $mimeType,
+                                'data'     => $base64,
+                            ],
+                        ],
+                        [
+                            'text' => $prompt,
+                        ],
+                    ],
+                ],
+            ],
+            'systemInstruction' => [
+                'parts' => [['text' => Prompts::SYSTEM]],
+            ],
+            'generationConfig' => [
+                'temperature' => $this->settings->GEMINI_TEMPERATURE,
+            ],
         ];
-        $data = $this->post('chat/completions', [
-            'model' => $this->settings->OPENAI_MODEL,
-            'messages' => $messages,
-            'temperature' => $this->settings->OPENAI_TEMPERATURE,
-        ]);
-        return [
-            'content' => $data['choices'][0]['message']['content'] ?? '',
-            'tokens'  => $data['usage']['total_tokens'] ?? 0,
-        ];
+
+        $model = !empty($this->settings->GEMINI_MODEL) ? $this->settings->GEMINI_MODEL : 'gemini-3.6-flash';
+        $endpoint = 'models/' . urlencode($model) . ':generateContent';
+        $data = $this->post($endpoint, $body);
+        return $this->extractTextAndTokens($data);
     }
 
     public function analyzeDocument(string $docText, string $action, ?string $question = null): array {
@@ -666,7 +757,7 @@ class DocumentService {
 class SpeechService {
     public function __construct(
         private TelegramAPI $tg,
-        private OpenAIService $openai
+        private GeminiService $gemini
     ) {}
 
     public function processVoice(string $fileId, string $ext = 'ogg'): array {
@@ -677,7 +768,7 @@ class SpeechService {
             if (!$this->tg->downloadFile($filePath, $tempPath))
                 return [null, "Ovozli faylni saqlab bo'lmadi."];
 
-            $text = $this->openai->transcribe($tempPath);
+            $text = $this->gemini->transcribe($tempPath);
             if ($text === '')
                 return [null, "❌ Ovozli xabarni tushunib bo'lmadi. Iltimos, yana bir marta yuboring."];
             return [$text, null];
@@ -692,7 +783,7 @@ class SpeechService {
 class ImageService {
     public function __construct(
         private TelegramAPI $tg,
-        private OpenAIService $openai
+        private GeminiService $gemini
     ) {}
 
     public function processPhoto(string $fileId, string $prompt): array {
@@ -703,7 +794,7 @@ class ImageService {
             if (!$this->tg->downloadFile($filePath, $tempPath))
                 throw new RuntimeException('Rasmni saqlab bo\'lmadi.');
             $b64 = base64_encode(file_get_contents($tempPath));
-            return $this->openai->analyzeImage($b64, $prompt);
+            return $this->gemini->analyzeImage($b64, $prompt, 'image/jpeg');
         } finally {
             @unlink($tempPath);
         }
@@ -890,7 +981,7 @@ class TelegramBot {
     private MessageRepository $msgs;
     private UsageRepository $usages;
     private FileRepository $files;
-    private OpenAIService $openai;
+    private GeminiService $gemini;
     private DocumentService $docService;
     private SpeechService $speechService;
     private ImageService $imageService;
@@ -918,10 +1009,10 @@ class TelegramBot {
         $this->usages  = new UsageRepository($pdo, $settings);
         $this->files   = new FileRepository($pdo);
 
-        $this->openai        = new OpenAIService($settings);
+        $this->gemini        = new GeminiService($settings);
         $this->docService    = new DocumentService();
-        $this->speechService = new SpeechService($tg, $this->openai);
-        $this->imageService  = new ImageService($tg, $this->openai);
+        $this->speechService = new SpeechService($tg, $this->gemini);
+        $this->imageService  = new ImageService($tg, $this->gemini);
 
         $this->states    = new StateManager($settings->DATA_DIR . '/states');
         $this->rateLimit = new RateLimiter(0.8);
@@ -936,7 +1027,7 @@ class TelegramBot {
 
         $me = $this->tg->call('getMe');
         $username = $me['result']['username'] ?? 'unknown';
-        $this->logger->info("Bot started: @{$username} | Model: {$this->settings->OPENAI_MODEL}");
+        $this->logger->info("Bot started: @{$username} | Model: {$this->settings->GEMINI_MODEL}");
 
         while (true) {
             try {
@@ -1180,7 +1271,7 @@ class TelegramBot {
         $payload[] = ['role' => 'user', 'content' => $transcription];
 
         try {
-            $res = $this->openai->chat($payload);
+            $res = $this->gemini->chat($payload);
             $this->msgs->add((int)$conv['id'], 'user', "[Voice]: {$transcription}");
             $this->msgs->add((int)$conv['id'], 'assistant', $res['content']);
             $this->convs->updateTitleIfDefault((int)$conv['id'], $transcription);
@@ -1312,7 +1403,7 @@ class TelegramBot {
         $statusId = $statusMsg['result']['message_id'] ?? 0;
 
         try {
-            $res = $this->openai->analyzeDocument($docText, $action);
+            $res = $this->gemini->analyzeDocument($docText, $action);
             $this->usages->record($uid, 'document', $res['tokens']);
             $this->tg->deleteMessage($chatId, $statusId);
 
@@ -1343,7 +1434,7 @@ class TelegramBot {
         $statusId = $statusMsg['result']['message_id'] ?? 0;
 
         try {
-            $res = $this->openai->analyzeDocument($docText, 'question', $question);
+            $res = $this->gemini->analyzeDocument($docText, 'question', $question);
             $this->usages->record($uid, 'document', $res['tokens']);
             $this->tg->deleteMessage($chatId, $statusId);
             foreach (Helpers::splitText("❓ <b>Savol:</b> <i>{$question}</i>\n\n📌 <b>Javob:</b>\n\n" . $res['content']) as $chunk) {
@@ -1382,7 +1473,7 @@ class TelegramBot {
         $this->tg->sendChatAction($chatId, 'typing');
 
         try {
-            $res = $this->openai->coding($text, $mode);
+            $res = $this->gemini->coding($text, $mode);
             $this->usages->record($uid, 'coding', $res['tokens']);
             $this->tg->deleteMessage($chatId, $statusId);
             foreach (Helpers::splitText($res['content']) as $chunk) {
@@ -1458,7 +1549,7 @@ class TelegramBot {
         $this->tg->sendChatAction($chatId, 'typing');
 
         try {
-            $res = $this->openai->runTool($tool, $text, $params);
+            $res = $this->gemini->runTool($tool, $text, $params);
             $this->usages->record($uid, 'tool', $res['tokens']);
             $this->tg->deleteMessage($chatId, $statusId);
             foreach (Helpers::splitText($res['content']) as $chunk) {
@@ -1496,8 +1587,8 @@ class TelegramBot {
     }
 
     private function cbModel(int $chatId, int $msgId, string $cbId): void {
-        $t = "🧠 <b>Model:</b> {$this->settings->OPENAI_MODEL}\n" .
-             "🎙 <b>Whisper:</b> {$this->settings->OPENAI_WHISPER_MODEL}\n" .
+        $t = "🧠 <b>Model:</b> {$this->settings->GEMINI_MODEL}\n" .
+             "🎙 <b>Ovoz:</b> Gemini Native Multimodal\n" .
              "Limit: {$this->settings->FREE_DAILY_LIMIT} ta/kun";
         $this->tg->editMessageText($chatId, $msgId, $t, Keyboards::settings());
         $this->tg->answerCallback($cbId);
@@ -1511,7 +1602,7 @@ class TelegramBot {
 
     private function cbAbout(int $chatId, int $msgId, string $cbId): void {
         $this->tg->editMessageText($chatId, $msgId,
-            "ℹ️ <b>Universal AI Assistant Bot</b>\n\nGPT-4o & PHP 8.1 asosida yaratilgan professional Telegram yordamchi.",
+            "ℹ️ <b>Universal AI Assistant Bot</b>\n\nGoogle Gemini & PHP 8.2 asosida yaratilgan professional Telegram yordamchi.",
             Keyboards::settings());
         $this->tg->answerCallback($cbId);
     }
@@ -1542,7 +1633,7 @@ class TelegramBot {
             $this->tg->editMessageText($chatId, $msgId, "👥 Jami: {$total} ta | 24 soatda faol: {$active} ta", Keyboards::admin());
         } elseif ($action === 'health') {
             $this->tg->editMessageText($chatId, $msgId,
-                "⚙️ <b>Holat:</b> 🟢 Faol\nModel: {$this->settings->OPENAI_MODEL}\nWhisper: {$this->settings->OPENAI_WHISPER_MODEL}",
+                "⚙️ <b>Holat:</b> 🟢 Faol\nModel: {$this->settings->GEMINI_MODEL}\nAudio/Vision: 🟢 Faol (Gemini Native)",
                 Keyboards::admin());
         } elseif ($action === 'broadcast') {
             $this->states->setState($uid, 'admin_broadcast');
@@ -1596,7 +1687,7 @@ class TelegramBot {
         $payload[] = ['role' => 'user', 'content' => $text];
 
         try {
-            $res = $this->openai->chat($payload);
+            $res = $this->gemini->chat($payload);
             $this->msgs->add((int)$conv['id'], 'user', $text);
             $this->msgs->add((int)$conv['id'], 'assistant', $res['content']);
             $this->convs->updateTitleIfDefault((int)$conv['id'], $text);
@@ -1630,8 +1721,8 @@ try {
         $logger->error("❌ BOT_TOKEN .env faylda sozlanmagan.");
         exit(1);
     }
-    if (empty($settings->OPENAI_API_KEY) || $settings->OPENAI_API_KEY === 'YOUR_OPENAI_API_KEY_HERE') {
-        $logger->error("❌ OPENAI_API_KEY .env faylda sozlanmagan.");
+    if (empty($settings->GEMINI_API_KEY) || $settings->GEMINI_API_KEY === 'YOUR_GEMINI_API_KEY_HERE') {
+        $logger->error("❌ GEMINI_API_KEY .env faylda sozlanmagan.");
         exit(1);
     }
 
